@@ -1,0 +1,51 @@
+Res: {"@type":"updateOption","name":"version","value":{"@type":"optionValueString","value":"1.7.0"}}
+Res: {"@type":"updateAuthorizationState","authorization_state":{"@type":"authorizationStateWaitTdlibParameters"}}
+Res: {"@type":"updateAuthorizationState","authorization_state":{"@type":"authorizationStateWaitEncryptionKey","is_encrypted":true}}
+Res: {"@type":"ok"}
+Res: {"@type":"updateOption","name":"unix_time","value":{"@type":"optionValueInteger","value":"1609896916"}}, updateOption
+Res: {"@type":"updateOption","name":"call_packet_timeout_ms","value":{"@type":"optionValueInteger","value":"10000"}}, updateOption
+Res: {"@type":"updateOption","name":"is_location_visible","value":{"@type":"optionValueBoolean","value":false}}, updateOption
+Res: {"@type":"updateOption","name":"call_connect_timeout_ms","value":{"@type":"optionValueInteger","value":"30000"}}, updateOption
+Res: {"@type":"updateOption","name":"favorite_stickers_limit","value":{"@type":"optionValueInteger","value":"5"}}, updateOption
+Res: {"@type":"updateOption","name":"forwarded_message_count_max","value":{"@type":"optionValueInteger","value":"100"}}, updateOption
+Res: {"@type":"updateOption","name":"ignore_sensitive_content_restrictions","value":{"@type":"optionValueBoolean","value":false}}, updateOption
+Res: {"@type":"updateOption","name":"telegram_service_notifications_chat_id","value":{"@type":"optionValueInteger","value":"777000"}}, updateOption
+Res: {"@type":"updateOption","name":"pinned_archived_chat_count_max","value":{"@type":"optionValueInteger","value":"100"}}, updateOption
+Res: {"@type":"updateOption","name":"group_anonymous_bot_user_id","value":{"@type":"optionValueInteger","value":"1087968824"}}, updateOption
+Res: {"@type":"updateOption","name":"message_caption_length_max","value":{"@type":"optionValueInteger","value":"1024"}}, updateOption
+Res: {"@type":"updateOption","name":"animation_search_bot_username","value":{"@type":"optionValueString","value":"gif"}}, updateOption
+Res: {"@type":"updateOption","name":"test_mode","value":{"@type":"optionValueBoolean","value":false}}, updateOption
+Res: {"@type":"updateOption","name":"t_me_url","value":{"@type":"optionValueString","value":"https://t.me/"}}, updateOption
+Res: {"@type":"updateOption","name":"expect_blocking","value":{"@type":"optionValueBoolean","value":false}}, updateOption
+Res: {"@type":"updateOption","name":"supergroup_size_max","value":{"@type":"optionValueInteger","value":"200000"}}, updateOption
+Res: {"@type":"updateOption","name":"pinned_chat_count_max","value":{"@type":"optionValueInteger","value":"5"}}, updateOption
+Res: {"@type":"updateOption","name":"calls_enabled","value":{"@type":"optionValueBoolean","value":true}}, updateOption
+Res: {"@type":"updateOption","name":"message_text_length_max","value":{"@type":"optionValueInteger","value":"4096"}}, updateOption
+Res: {"@type":"updateOption","name":"photo_search_bot_username","value":{"@type":"optionValueString","value":"bing"}}, updateOption
+Res: {"@type":"updateOption","name":"my_id","value":{"@type":"optionValueInteger","value":"1140795952"}}, updateOption
+Res: {"@type":"updateOption","name":"basic_group_size_max","value":{"@type":"optionValueInteger","value":"200"}}, updateOption
+Res: {"@type":"updateOption","name":"venue_search_bot_username","value":{"@type":"optionValueString","value":"foursquare"}}, updateOption
+Res: {"@type":"updateOption","name":"replies_bot_chat_id","value":{"@type":"optionValueInteger","value":"1271266957"}}, updateOption
+Res: {"@type":"updateOption","name":"animated_emoji_sticker_set_name","value":{"@type":"optionValueString","value":"AnimatedEmojies"}}, updateOption
+Res: {"@type":"updateOption","name":"archive_and_mute_new_chats_from_unknown_users","value":{"@type":"optionValueBoolean","value":false}}, updateOption
+Res: {"@type":"updateOption","name":"can_ignore_sensitive_content_restrictions","value":{"@type":"optionValueBoolean","value":true}}, updateOption
+Res: {"@type":"updateOption","name":"authorization_date","value":{"@type":"optionValueInteger","value":"1609896815"}}, updateOption
+Res: {"@type":"updateAuthorizationState","authorization_state":{"@type":"authorizationStateReady"}}, updateAuthorizationState
+Res: {"@type":"ok"}, ok
+Res: {"@type":"updateSelectedBackground","for_dark_theme":false}, updateSelectedBackground
+Res: {"@type":"updateSelectedBackground","for_dark_theme":true}, updateSelectedBackground
+Res: {"@type":"updateDiceEmojis","emojis":["\ud83c\udfb2","\ud83c\udfaf","\ud83c\udfc0","\u26bd","\u26bd\ufe0f","\ud83c\udfb0","\ud83c\udfb3"]}, updateDiceEmojis
+Res: {"@type":"updateScopeNotificationSettings","scope":{"@type":"notificationSettingsScopePrivateChats"},"notification_settings":{"@type":"scopeNotificationSettings","mute_for":0,"sound":"default","show_preview":true,"disable_pinned_message_notifications":false,"disable_mention_notifications":false}}, updateScopeNotificationSettings
+Res: {"@type":"updateScopeNotificationSettings","scope":{"@type":"notificationSettingsScopeGroupChats"},"notification_settings":{"@type":"scopeNotificationSettings","mute_for":0,"sound":"default","show_preview":true,"disable_pinned_message_notifications":false,"disable_mention_notifications":false}}, updateScopeNotificationSettings
+Res: {"@type":"updateScopeNotificationSettings","scope":{"@type":"notificationSettingsScopeChannelChats"},"notification_settings":{"@type":"scopeNotificationSettings","mute_for":0,"sound":"default","show_preview":true,"disable_pinned_message_notifications":false,"disable_mention_notifications":false}}, updateScopeNotificationSettings
+Res: {"@type":"updateChatFilters","chat_filters":[]}, updateChatFilters
+Res: {"@type":"updateHavePendingNotifications","have_delayed_notifications":false,"have_unreceived_notifications":true}, updateHavePendingNotifications
+Res: {"@type":"updateConnectionState","state":{"@type":"connectionStateConnecting"}}, updateConnectionState
+Res: {"@type":"updateAnimationSearchParameters","provider":"tenor","emojis":["\ud83d\udc4d","\ud83d\ude18","\ud83d\ude0d","\ud83d\ude21","\ud83e\udd73","\ud83d\ude02","\ud83d\ude2e","\ud83d\ude44","\ud83d\ude0e","\ud83d\udc4e"]}, updateAnimationSearchParameters
+Res: {"@type":"error","code":8,"message":"Call to setAuthenticationPhoneNumber unexpected"}, error
+Res: {"@type":"updateOption","name":"unix_time","value":{"@type":"optionValueInteger","value":"1609896916"}}, updateOption
+Res: {"@type":"updateConnectionState","state":{"@type":"connectionStateUpdating"}}, updateConnectionState
+Res: {"@type":"updateHavePendingNotifications","have_delayed_notifications":false,"have_unreceived_notifications":false}, updateHavePendingNotifications
+Res: {"@type":"updateConnectionState","state":{"@type":"connectionStateReady"}}, updateConnectionState
+Res: {"@type":"updateOption","name":"unix_time","value":{"@type":"optionValueInteger","value":"1609896917"}}, updateOption
+Res: {"@type":"updateUser","user":{"@type":"user","id":1140795952,"first_name":"Joseph","last_name":"Barr","username":"","phone_number":"18122127813","status":{"@type":"userStatusOnline","expires":1609897114},"profile_photo":{"@type":"profilePhoto","id":"5181566975778859144","small":{"@type":"file","id":1,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":true,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"AQADAQADiKgxG7af6EcACPDcbgYABAIAAzAq_0MABKWHAeyhg4jdrVsBAAEeBA","unique_id":"AQAD8NxuBgAErVsBAAE","is_uploading_active":false,"is_uploading_completed":true,"uploaded_size":0}},"big":{"@type":"file","id":2,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":true,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"AQADAQADiKgxG7af6EcACPDcbgYABAMAAzAq_0MABKWHAeyhg4jdr1sBAAEeBA","unique_id":"AQAD8NxuBgAEr1sBAAE","is_uploading_active":false,"is_uploading_completed":true,"uploaded_size":0}},"has_animation":false},"is_contact":true,"is_mutual_contact":true,"is_verified":false,"is_support":false,"restriction_reason":"","is_scam":false,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":""}}, updateUser
