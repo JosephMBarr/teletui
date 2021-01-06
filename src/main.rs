@@ -1,26 +1,34 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Stdout};
 use std::vec;
 
 use crossbeam::thread;
-/*
 use termion::raw::IntoRawMode;
+use termion::raw::RawTerminal;
 use tui::backend::TermionBackend;
 use tui::layout::Rect;
 use tui::style::{Color, Style};
 use tui::text::Span;
 use tui::widgets::{Block, Borders};
 use tui::Terminal;
-*/
 
 use rtdlib::types::*;
 use rtdlib::Tdlib;
 
 const TIMEOUT: f64 = 60.0;
+const DEBUG_LEVEL: i64 = 0;
 
-fn main() {
-    let (api_id, api_hash, phone_number) = read_info().unwrap();
+fn main() -> io::Result<()> {
     let tdlib = Tdlib::new();
+    let set_verbosity_level = SetLogVerbosityLevel::builder()
+        .new_verbosity_level(DEBUG_LEVEL)
+        .build();
+    tdlib.send(&set_verbosity_level.to_json().unwrap());
+    let stdout = io::stdout().into_raw_mode()?;
+    let backend = TermionBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let (api_id, api_hash, phone_number) = read_info().unwrap();
     let mut chat_vec = vec::Vec::new();
     //Main listening loop
     thread::scope(|s| {
@@ -84,7 +92,7 @@ fn main() {
                                 chat_vec.push(Chat::from_json(new_chat.to_string()));
                             }
                             _ => {
-                                println!("Res: {}, {}", res, obj["@type"]);
+                                //println!("Res: {}, {}", res, obj["@type"]);
                             }
                         }
                     }
@@ -94,14 +102,14 @@ fn main() {
                 }
             }
         });
-
+        draw_tui(&mut terminal);
         let _rec_result = rec_thread.join().unwrap();
     })
     .unwrap();
-    /*
-    let stdout = io::stdout().into_raw_mode()?;
-    let backend = TermionBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    Ok(())
+}
+
+fn draw_tui(terminal: &mut Terminal<TermionBackend<RawTerminal<Stdout>>>) -> io::Result<()> {
     terminal.clear();
     terminal.draw(|f| {
         let size = f.size();
@@ -113,10 +121,9 @@ fn main() {
             Style::default().fg(Color::Yellow),
         ));
 
-        let name_area = Rect::new(5, 5, 10, 10);
+        let name_area = Rect::new(5, 5, 20, 20);
         f.render_widget(myname, name_area);
     })
-    */
 }
 
 fn read_info() -> io::Result<(i64, String, String)> {
