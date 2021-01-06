@@ -12,3 +12,4 @@ tui = "0.14"
 termion = "1.5"
 rtdlib = { version = "1.6.*", features = ["sys"] }
 json = "*"
+crossbeam= "*"
