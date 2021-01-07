@@ -1,19 +1,23 @@
+mod event;
+use event::{Event, Events};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Stdout};
+use std::io::{self, BufRead, BufReader, Error, ErrorKind, Stdout};
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use crossbeam::thread;
-use termion::raw::IntoRawMode;
-use termion::raw::RawTerminal;
-use tui::backend::TermionBackend;
-use tui::layout::Rect;
-use tui::style::{Color, Style};
-use tui::text::Span;
-use tui::widgets::{Block, Borders};
-use tui::Terminal;
-
 use rtdlib::types::*;
 use rtdlib::Tdlib;
+use termion::raw::RawTerminal;
+use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
+use tui::{
+    backend::TermionBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Span, Spans, Text},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
 
 const TIMEOUT: f64 = 60.0;
 const DEBUG_LEVEL: i64 = 0;
@@ -25,14 +29,18 @@ fn main() -> io::Result<()> {
         .build();
     tdlib.send(&set_verbosity_level.to_json().unwrap());
     let stdout = io::stdout().into_raw_mode()?;
+    let stdout = MouseTerminal::from(stdout);
+    let stdout = AlternateScreen::from(stdout);
     let backend = TermionBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (api_id, api_hash, phone_number) = read_info().unwrap();
-    let mut chat_vec = vec::Vec::new();
+    let mut input_str = String::new();
     //Main listening loop
     thread::scope(|s| {
-        let rec_thread = s.spawn(|_| {
+        let mut chat_vec = Arc::new((Mutex::new(Vec::new())));
+        let rec_chat_vec = chat_vec.clone();
+        let rec_thread = s.spawn(move |_| {
             loop {
                 match tdlib.receive(TIMEOUT) {
                     Some(res) => {
@@ -63,10 +71,14 @@ fn main() -> io::Result<()> {
                                                 == "authenticationCodeTypeTelegramMessage"
                                         {
                                             println!("Input that code king!");
+                                            /* TODO: auth code interface so don't have to hardcode it
                                             let mut input_text = String::new();
                                             io::stdin()
                                                 .read_line(&mut input_text)
                                                 .expect("failed to read from stdin");
+                                            */
+
+                                            let input_text = "70534";
 
                                             let check_auth_code =
                                                 CheckAuthenticationCode::builder()
@@ -89,7 +101,10 @@ fn main() -> io::Result<()> {
                                 new_chat["pinned_message_id"] = json::JsonValue::from(0);
                                 //END WEIRD STOPGAP
 
-                                chat_vec.push(Chat::from_json(new_chat.to_string()));
+                                rec_chat_vec
+                                    .lock()
+                                    .unwrap()
+                                    .push(Chat::from_json(new_chat.to_string()).unwrap());
                             }
                             _ => {
                                 //println!("Res: {}, {}", res, obj["@type"]);
@@ -102,27 +117,90 @@ fn main() -> io::Result<()> {
                 }
             }
         });
-        draw_tui(&mut terminal);
+        //draw_tui(&mut terminal);
+
+        let events = Events::new();
+        let ui_chat_vec = chat_vec.clone();
+        loop {
+            //terminal.clear();
+            terminal.draw(|f| {
+                let size = f.size();
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
+                    .split(size);
+                let chat_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .margin(1)
+                    .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+                    .split(chunks[0]);
+                let input_block = Block::default().title("Input").borders(Borders::ALL);
+                f.render_widget(input_block, chunks[1]);
+                let mut chat_titles = vec::Vec::new();
+                {
+                    let local_chat_vec = ui_chat_vec.lock().unwrap().clone();
+                    for i in 0..local_chat_vec.len() {
+                        let chat = local_chat_vec.get(i).unwrap();
+                        chat_titles.push(ListItem::new(Text::from(String::from(chat.title()))));
+                    }
+                }
+                let chats_block = List::new(chat_titles)
+                    .block(Block::default().title("Chats").borders(Borders::ALL));
+                f.render_widget(chats_block, chat_chunks[0]);
+                let chat_block = Block::default().title("Current Chat").borders(Borders::ALL);
+                f.render_widget(chat_block, chat_chunks[1]);
+
+                let input = Paragraph::new(input_str.as_ref())
+                    .block(Block::default().borders(Borders::ALL).title("Input"));
+                f.render_widget(input, chunks[1]);
+            });
+            let enext = match events.next() {
+                Ok(eve) => eve,
+                Err(e) => return Err(Error::new(ErrorKind::Other, "oh no!")),
+            };
+            if let Event::Input(input) = enext {
+                match input {
+                    Key::Char('\n') => {
+                        //app.messages.push(app.input.drain(..).collect());
+                    }
+                    Key::Char(c) => {
+                        input_str.push(c);
+                    }
+                    Key::Backspace => {
+                        input_str.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
         let _rec_result = rec_thread.join().unwrap();
     })
-    .unwrap();
-    Ok(())
+    .unwrap()
 }
 
 fn draw_tui(terminal: &mut Terminal<TermionBackend<RawTerminal<Stdout>>>) -> io::Result<()> {
     terminal.clear();
     terminal.draw(|f| {
         let size = f.size();
-        let block = Block::default().title("Block").borders(Borders::ALL);
-        f.render_widget(block, size);
 
-        let myname = Block::default().title(Span::styled(
-            "Joseph Barr",
-            Style::default().fg(Color::Yellow),
-        ));
-
-        let name_area = Rect::new(5, 5, 20, 20);
-        f.render_widget(myname, name_area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
+            .split(size);
+        let chat_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .margin(1)
+            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+            .split(chunks[0]);
+        let input_block = Block::default().title("Input").borders(Borders::ALL);
+        f.render_widget(input_block, chunks[1]);
+        let chats_block = Block::default().title("Chats").borders(Borders::ALL);
+        f.render_widget(chats_block, chat_chunks[0]);
+        let chat_block = Block::default().title("Current Chat").borders(Borders::ALL);
+        f.render_widget(chat_block, chat_chunks[1]);
     })
 }
 

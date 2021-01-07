@@ -1,3 +1,0 @@
-astate {"@type":"authorizationStateWaitTdlibParameters"}
-astate {"@type":"authorizationStateWaitEncryptionKey","is_encrypted":true}
-astate {"@type":"authorizationStateReady"}
