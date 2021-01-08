@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 use std::io;
 use std::sync::mpsc;
 use std::sync::{
@@ -17,6 +18,7 @@ pub enum Event<I> {
 
 /// A small event handler that wrap termion input and tick events. Each event
 /// type is handled in its own thread and returned to a common `Receiver`
+#[allow(dead_code)]
 pub struct Events {
     rx: mpsc::Receiver<Event<Key>>,
     input_handle: thread::JoinHandle<()>,
@@ -39,6 +41,7 @@ impl Default for Config {
     }
 }
 
+#[allow(dead_code)]
 impl Events {
     pub fn new() -> Events {
         Events::with_config(Config::default())

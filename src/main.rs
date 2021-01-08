@@ -1,26 +1,71 @@
 mod event;
-use event::{Event, Events};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Error, ErrorKind, Stdout};
-use std::sync::{Arc, Mutex};
-use std::vec;
-
 use crossbeam::thread;
+use event::{Event, Events};
 use rtdlib::types::*;
 use rtdlib::Tdlib;
-use termion::raw::RawTerminal;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Error, ErrorKind};
+use std::sync::{Arc, Mutex};
+use std::vec;
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
     backend::TermionBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
+    text::Text,
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
 
 const TIMEOUT: f64 = 60.0;
 const DEBUG_LEVEL: i64 = 0;
+const NUM_BLOCKS: i32 = 3;
+
+/*
+enum InputMode {
+    Normal,
+    Insert,
+}
+*/
+struct Chats {
+    chat_vec: Arc<Mutex<Vec<Chat>>>,
+    name: &'static str,
+    selected_index: i32,
+}
+trait TBlock {
+    fn new(name: &'static str) -> Self;
+
+    fn scroll_up(&mut self) {}
+    fn scroll_down(&mut self) {}
+    fn get_len(&self) -> Result<i32, io::Error> {
+        Ok(-1)
+    }
+}
+
+impl TBlock for Chats {
+    fn new(name: &'static str) -> Chats {
+        Chats {
+            chat_vec: Arc::new(Mutex::new(Vec::new())),
+            name: name,
+            selected_index: 0,
+        }
+    }
+    fn get_len(&self) -> Result<i32, io::Error> {
+        let cur_size: usize = self.chat_vec.lock().unwrap().len();
+        if cur_size > u32::MAX as usize {
+            let e = Error::new(ErrorKind::Other, "too many chats!");
+            Err(e)
+        } else {
+            Ok(cur_size as i32)
+        }
+    }
+    fn scroll_up(&mut self) {
+        self.selected_index = (self.selected_index - 1) % self.get_len().unwrap();
+    }
+    fn scroll_down(&mut self) {
+        self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
+    }
+}
 
 fn main() -> io::Result<()> {
     let tdlib = Tdlib::new();
@@ -28,19 +73,14 @@ fn main() -> io::Result<()> {
         .new_verbosity_level(DEBUG_LEVEL)
         .build();
     tdlib.send(&set_verbosity_level.to_json().unwrap());
-    let stdout = io::stdout().into_raw_mode()?;
-    let stdout = MouseTerminal::from(stdout);
-    let stdout = AlternateScreen::from(stdout);
-    let backend = TermionBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
 
     let (api_id, api_hash, phone_number) = read_info().unwrap();
     let mut input_str = String::new();
     //Main listening loop
     thread::scope(|s| {
-        let mut chat_vec = Arc::new((Mutex::new(Vec::new())));
-        let rec_chat_vec = chat_vec.clone();
-        let rec_thread = s.spawn(move |_| {
+        let chat_list = Chats::new("Chats");
+        let rec_chat_vec = chat_list.chat_vec.clone();
+        let _rec_thread = s.spawn(move |_| {
             loop {
                 match tdlib.receive(TIMEOUT) {
                     Some(res) => {
@@ -78,7 +118,7 @@ fn main() -> io::Result<()> {
                                                 .expect("failed to read from stdin");
                                             */
 
-                                            let input_text = "70534";
+                                            let input_text = "42101";
 
                                             let check_auth_code =
                                                 CheckAuthenticationCode::builder()
@@ -117,91 +157,108 @@ fn main() -> io::Result<()> {
                 }
             }
         });
-        //draw_tui(&mut terminal);
 
         let events = Events::new();
-        let ui_chat_vec = chat_vec.clone();
-        loop {
-            //terminal.clear();
-            terminal.draw(|f| {
-                let size = f.size();
+        let ui_chat_vec = chat_list.chat_vec.clone();
+        {
+            let stdout = io::stdout().into_raw_mode()?;
+            let stdout = MouseTerminal::from(stdout);
+            let stdout = AlternateScreen::from(stdout);
+            let backend = TermionBackend::new(stdout);
+            let mut terminal = Terminal::new(backend)?;
+            let mut selected_block = 0;
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .margin(1)
-                    .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
-                    .split(size);
-                let chat_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .margin(1)
-                    .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-                    .split(chunks[0]);
-                let input_block = Block::default().title("Input").borders(Borders::ALL);
-                f.render_widget(input_block, chunks[1]);
-                let mut chat_titles = vec::Vec::new();
-                {
-                    let local_chat_vec = ui_chat_vec.lock().unwrap().clone();
-                    for i in 0..local_chat_vec.len() {
-                        let chat = local_chat_vec.get(i).unwrap();
-                        chat_titles.push(ListItem::new(Text::from(String::from(chat.title()))));
-                    }
-                }
-                let chats_block = List::new(chat_titles)
-                    .block(Block::default().title("Chats").borders(Borders::ALL));
-                f.render_widget(chats_block, chat_chunks[0]);
-                let chat_block = Block::default().title("Current Chat").borders(Borders::ALL);
-                f.render_widget(chat_block, chat_chunks[1]);
+            let selected_style: Style = Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD);
+            let _unselected_style: Style = Style::default().fg(Color::White);
 
-                let input = Paragraph::new(input_str.as_ref())
-                    .block(Block::default().borders(Borders::ALL).title("Input"));
-                f.render_widget(input, chunks[1]);
-            });
-            let enext = match events.next() {
-                Ok(eve) => eve,
-                Err(e) => return Err(Error::new(ErrorKind::Other, "oh no!")),
-            };
-            if let Event::Input(input) = enext {
-                match input {
-                    Key::Char('\n') => {
-                        //app.messages.push(app.input.drain(..).collect());
+            terminal.clear()?;
+            loop {
+                terminal.draw(|f| {
+                    let size = f.size();
+
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints(
+                            [Constraint::Percentage(85), Constraint::Percentage(15)].as_ref(),
+                        )
+                        .split(size);
+                    let chat_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .margin(1)
+                        .constraints(
+                            [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
+                        )
+                        .split(chunks[0]);
+                    let mut chat_titles = vec::Vec::new();
+                    {
+                        let local_chat_vec = ui_chat_vec.lock().unwrap().clone();
+                        for i in 0..chat_list.get_len().unwrap() {
+                            let chat = local_chat_vec.get(i as usize).unwrap();
+                            let mut chat_list_item =
+                                ListItem::new(Text::from(String::from(chat.title())));
+                            if chat_list.selected_index == i {
+                                chat_list_item = chat_list_item.style(selected_style);
+                            }
+
+                            chat_titles.push(chat_list_item);
+                        }
                     }
-                    Key::Char(c) => {
-                        input_str.push(c);
+
+                    let mut chats_block = List::new(chat_titles)
+                        .block(Block::default().title(chat_list.name).borders(Borders::ALL));
+                    let mut chat_block =
+                        Block::default().title("Current Chat").borders(Borders::ALL);
+
+                    let mut input_block = Block::default().title("Input").borders(Borders::ALL);
+                    let input = Paragraph::new(input_str.as_ref())
+                        .block(Block::default().borders(Borders::ALL).title("Input"));
+
+                    match selected_block {
+                        0 => chats_block = chats_block.style(selected_style),
+                        1 => chat_block = chat_block.style(selected_style),
+                        2 => input_block = input_block.style(selected_style),
+                        _ => (),
                     }
-                    Key::Backspace => {
-                        input_str.pop();
+
+                    f.render_widget(input_block, chunks[1]);
+                    f.render_widget(chats_block, chat_chunks[0]);
+                    f.render_widget(chat_block, chat_chunks[1]);
+                    f.render_widget(input, chunks[1]);
+                })?;
+                let enext = match events.next() {
+                    Ok(eve) => eve,
+                    Err(_e) => return Err(Error::new(ErrorKind::Other, "oh no!")),
+                };
+                if let Event::Input(input) = enext {
+                    match input {
+                        Key::Char('\n') => {
+                            //app.messages.push(app.input.drain(..).collect());
+                            return Ok(());
+                        }
+                        Key::Char('\t') => {
+                            //app.messages.push(app.input.drain(..).collect());
+                            selected_block = (selected_block + 1) % NUM_BLOCKS;
+                        }
+                        Key::Ctrl('\t') => {
+                            selected_block = (selected_block - 1) % NUM_BLOCKS;
+                        }
+                        Key::Char(c) => {
+                            input_str.push(c);
+                        }
+                        Key::Backspace => {
+                            input_str.pop();
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
-        let _rec_result = rec_thread.join().unwrap();
+        //let _rec_result = rec_thread.join().unwrap();
     })
     .unwrap()
-}
-
-fn draw_tui(terminal: &mut Terminal<TermionBackend<RawTerminal<Stdout>>>) -> io::Result<()> {
-    terminal.clear();
-    terminal.draw(|f| {
-        let size = f.size();
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
-            .split(size);
-        let chat_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .margin(1)
-            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-            .split(chunks[0]);
-        let input_block = Block::default().title("Input").borders(Borders::ALL);
-        f.render_widget(input_block, chunks[1]);
-        let chats_block = Block::default().title("Chats").borders(Borders::ALL);
-        f.render_widget(chats_block, chat_chunks[0]);
-        let chat_block = Block::default().title("Current Chat").borders(Borders::ALL);
-        f.render_widget(chat_block, chat_chunks[1]);
-    })
 }
 
 fn read_info() -> io::Result<(i64, String, String)> {
