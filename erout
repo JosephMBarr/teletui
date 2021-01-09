@@ -1,0 +1,87 @@
+   Compiling tele v0.1.0 (/home/joseph/rust/tele)
+warning: unused variable: `queue`
+  --> src/main.rs:59:9
+   |
+59 |         queue: &Arc<Mutex<VecDeque<String>>>,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_queue`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `input`
+  --> src/main.rs:60:9
+   |
+60 |         input: &termion::event::Key,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: unused variable: `queue`
+  --> src/main.rs:65:9
+   |
+65 |         queue: &Arc<Mutex<VecDeque<String>>>,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_queue`
+
+warning: unused variable: `input`
+  --> src/main.rs:66:9
+   |
+66 |         input: &termion::event::Key,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: variable does not need to be mutable
+   --> src/main.rs:156:29
+    |
+156 |                         let mut obj = json::parse(&res).unwrap();
+    |                             ----^^^
+    |                             |
+    |                             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> src/main.rs:142:9
+    |
+142 |     let mut input_str = String::new();
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: constant is never used: `NUM_BLOCKS`
+  --> src/main.rs:23:1
+   |
+23 | const NUM_BLOCKS: i32 = 3;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: variant is never constructed: `Insert`
+  --> src/main.rs:28:5
+   |
+28 |     Insert,
+   |     ^^^^^^
+
+warning: unused `std::result::Result` that must be used
+   --> src/main.rs:364:37
+    |
+364 | ...                   terminal.clear();
+    |                       ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_must_use)]` on by default
+    = note: this `Result` may be an `Err` variant, which should be handled
+
+warning: 9 warnings emitted
+
+    Finished dev [unoptimized + debuginfo] target(s) in 10.12s
+     Running `target/debug/tele`
+[1;36m[ 3][t 3][1610212787.615714073][Td.cpp:4588][#1][!Td][&td_requests]	Sending update: updateOption {
+  name = "version"
+  value = optionValueString {
+    value = "1.7.0"
+  }
+}[0m
+[1;36m[ 3][t 3][1610212787.615832090][Td.cpp:4588][#1][!Td][&td_requests]	Sending update: updateAuthorizationState {
+  authorization_state = authorizationStateWaitTdlibParameters {
+  }
+}[0m
+[1;36m[ 3][t 3][1610212787.616074085][Td.cpp:3449][#1][!Td][&td_requests]	Receive request 1: setLogVerbosityLevel {
+  new_verbosity_level = 0
+}[0m
+thread '<unnamed>' panicked at 'called `Result::unwrap()` on an `Err` value: SerdeJson(Error("missing field `$ field`", line: 0, column: 0))', src/main.rs:240:86
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -3,6 +3,7 @@ use crossbeam::thread;
 use event::{Event, Events};
 use rtdlib::types::*;
 use rtdlib::Tdlib;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind};
 use std::sync::{Arc, Mutex};
@@ -17,20 +18,33 @@ use tui::{
     Terminal,
 };
 
-const TIMEOUT: f64 = 60.0;
+const TIMEOUT: f64 = 0.5;
 const DEBUG_LEVEL: i64 = 0;
 const NUM_BLOCKS: i32 = 3;
+const DO_DEBUG: bool = false;
 
-/*
 enum InputMode {
     Normal,
     Insert,
 }
-*/
+enum TBlocks {
+    ChatList,
+    CurrChat,
+    Input,
+}
+struct App {
+    curr_mode: InputMode,
+    outgoing_queue: Arc<Mutex<VecDeque<String>>>,
+}
 struct Chats {
-    chat_vec: Arc<Mutex<Vec<Chat>>>,
+    chat_vec: Arc<Mutex<Vec<TChat>>>,
     name: &'static str,
     selected_index: i32,
+}
+#[derive(Clone)]
+struct TChat {
+    history: Arc<Mutex<Vec<json::JsonValue>>>,
+    chat: Chat,
 }
 trait TBlock {
     fn new(name: &'static str) -> Self;
@@ -39,6 +53,41 @@ trait TBlock {
     fn scroll_down(&mut self) {}
     fn get_len(&self) -> Result<i32, io::Error> {
         Ok(-1)
+    }
+    fn handle_input_insert(
+        &mut self,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+        input: &termion::event::Key,
+    ) {
+    }
+    fn handle_input_normal(
+        &mut self,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+        input: &termion::event::Key,
+    ) {
+    }
+}
+impl Chats {
+    fn select_chat(&self, index: i32, queue: &Arc<Mutex<VecDeque<String>>>) {
+        let curr_chat = self
+            .chat_vec
+            .lock()
+            .unwrap()
+            .get(index as usize)
+            .unwrap()
+            .clone();
+        let chat_history_req = GetChatHistory::builder()
+            .chat_id(curr_chat.chat.id())
+            .from_message_id(0)
+            .offset(0)
+            .limit(10)
+            .only_local(false)
+            .build();
+
+        queue
+            .lock()
+            .unwrap()
+            .push_back(chat_history_req.to_json().unwrap());
     }
 }
 
@@ -61,9 +110,24 @@ impl TBlock for Chats {
     }
     fn scroll_up(&mut self) {
         self.selected_index = (self.selected_index - 1) % self.get_len().unwrap();
+        if self.selected_index < 0 {
+            self.selected_index = self.get_len().unwrap() - 1;
+        }
     }
     fn scroll_down(&mut self) {
         self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
+    }
+    fn handle_input_normal(
+        &mut self,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+        input: &termion::event::Key,
+    ) {
+        match input {
+            Key::Char('j') => self.scroll_down(),
+            Key::Char('k') => self.scroll_up(),
+            Key::Char('\n') => self.select_chat(self.selected_index, queue),
+            _ => {}
+        }
     }
 }
 
@@ -78,13 +142,18 @@ fn main() -> io::Result<()> {
     let mut input_str = String::new();
     //Main listening loop
     thread::scope(|s| {
-        let chat_list = Chats::new("Chats");
+        let mut chat_list = Chats::new("Chats");
+        let mut app = App {
+            curr_mode: InputMode::Normal,
+            outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
+        };
         let rec_chat_vec = chat_list.chat_vec.clone();
+        let rec_outgoing_queue = app.outgoing_queue.clone();
         let _rec_thread = s.spawn(move |_| {
             loop {
                 match tdlib.receive(TIMEOUT) {
                     Some(res) => {
-                        let obj = json::parse(&res).unwrap();
+                        let mut obj = json::parse(&res).unwrap();
                         match obj["@type"].as_str().unwrap() {
                             "updateAuthorizationState" => {
                                 let astate = &obj["authorization_state"];
@@ -118,7 +187,7 @@ fn main() -> io::Result<()> {
                                                 .expect("failed to read from stdin");
                                             */
 
-                                            let input_text = "42101";
+                                            let input_text = "91274";
 
                                             let check_auth_code =
                                                 CheckAuthenticationCode::builder()
@@ -141,18 +210,38 @@ fn main() -> io::Result<()> {
                                 new_chat["pinned_message_id"] = json::JsonValue::from(0);
                                 //END WEIRD STOPGAP
 
-                                rec_chat_vec
-                                    .lock()
-                                    .unwrap()
-                                    .push(Chat::from_json(new_chat.to_string()).unwrap());
+                                let tchat = TChat {
+                                    chat: Chat::from_json(new_chat.to_string()).unwrap(),
+                                    history: Arc::new(Mutex::new(Vec::new())),
+                                };
+                                rec_chat_vec.lock().unwrap().push(tchat);
+                            }
+                            "messages" => {
+                                eprintln!("woopsy: {}", obj.to_string());
+                                let loc_rec_chat_vec = rec_chat_vec.lock().unwrap().clone();
+                                let msg_list = &mut obj["messages"].clone();
+                                let msg_count = &mut obj["total_count"].as_usize().unwrap();
+                                let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
+                                let mut counter = 0;
+                                let cur_chat = get_chat_by_id(&loc_rec_chat_vec, *chat_id);
+                                for _ in 0..*msg_count {
+                                    cur_chat.history.lock().unwrap().push(msg_list.pop());
+                                }
                             }
                             _ => {
-                                //println!("Res: {}, {}", res, obj["@type"]);
+                                if DO_DEBUG {
+                                    eprintln!("Received: {}", obj);
+                                }
                             }
                         }
                     }
                     None => {
-                        println!("There was an error!");
+                        //Didn't receive, free to send
+                        let sz = rec_outgoing_queue.lock().unwrap().len();
+                        for _ in 0..sz {
+                            let s = rec_outgoing_queue.lock().unwrap().pop_front().unwrap();
+                            tdlib.send(&s);
+                        }
                     }
                 }
             }
@@ -160,18 +249,20 @@ fn main() -> io::Result<()> {
 
         let events = Events::new();
         let ui_chat_vec = chat_list.chat_vec.clone();
+        let ui_outgoing_queue = app.outgoing_queue.clone();
         {
             let stdout = io::stdout().into_raw_mode()?;
             let stdout = MouseTerminal::from(stdout);
             let stdout = AlternateScreen::from(stdout);
             let backend = TermionBackend::new(stdout);
             let mut terminal = Terminal::new(backend)?;
-            let mut selected_block = 0;
 
             let selected_style: Style = Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD);
-            let _unselected_style: Style = Style::default().fg(Color::White);
+            let unselected_style: Style = Style::default().fg(Color::White);
+
+            let mut selected_block = TBlocks::ChatList;
 
             terminal.clear()?;
             loop {
@@ -193,14 +284,22 @@ fn main() -> io::Result<()> {
                         )
                         .split(chunks[0]);
                     let mut chat_titles = vec::Vec::new();
+                    let mut chat_history = vec::Vec::new();
                     {
                         let local_chat_vec = ui_chat_vec.lock().unwrap().clone();
                         for i in 0..chat_list.get_len().unwrap() {
                             let chat = local_chat_vec.get(i as usize).unwrap();
                             let mut chat_list_item =
-                                ListItem::new(Text::from(String::from(chat.title())));
+                                ListItem::new(Text::from(String::from(chat.chat.title())));
                             if chat_list.selected_index == i {
                                 chat_list_item = chat_list_item.style(selected_style);
+                                for msg in chat.history.lock().unwrap().clone().into_iter() {
+                                    chat_history.push(ListItem::new(Text::from(
+                                        msg["content"]["text"]["text"].to_string(),
+                                    )));
+                                }
+                            } else {
+                                chat_list_item = chat_list_item.style(unselected_style);
                             }
 
                             chat_titles.push(chat_list_item);
@@ -209,18 +308,17 @@ fn main() -> io::Result<()> {
 
                     let mut chats_block = List::new(chat_titles)
                         .block(Block::default().title(chat_list.name).borders(Borders::ALL));
-                    let mut chat_block =
-                        Block::default().title("Current Chat").borders(Borders::ALL);
+                    let mut chat_block = List::new(chat_history)
+                        .block(Block::default().title("Current Chat").borders(Borders::ALL));
 
                     let mut input_block = Block::default().title("Input").borders(Borders::ALL);
                     let input = Paragraph::new(input_str.as_ref())
                         .block(Block::default().borders(Borders::ALL).title("Input"));
 
                     match selected_block {
-                        0 => chats_block = chats_block.style(selected_style),
-                        1 => chat_block = chat_block.style(selected_style),
-                        2 => input_block = input_block.style(selected_style),
-                        _ => (),
+                        TBlocks::ChatList => chats_block = chats_block.style(selected_style),
+                        TBlocks::CurrChat => chat_block = chat_block.style(selected_style),
+                        TBlocks::Input => input_block = input_block.style(selected_style),
                     }
 
                     f.render_widget(input_block, chunks[1]);
@@ -233,25 +331,50 @@ fn main() -> io::Result<()> {
                     Err(_e) => return Err(Error::new(ErrorKind::Other, "oh no!")),
                 };
                 if let Event::Input(input) = enext {
-                    match input {
-                        Key::Char('\n') => {
-                            //app.messages.push(app.input.drain(..).collect());
-                            return Ok(());
-                        }
-                        Key::Char('\t') => {
-                            //app.messages.push(app.input.drain(..).collect());
-                            selected_block = (selected_block + 1) % NUM_BLOCKS;
-                        }
-                        Key::Ctrl('\t') => {
-                            selected_block = (selected_block - 1) % NUM_BLOCKS;
-                        }
-                        Key::Char(c) => {
-                            input_str.push(c);
-                        }
-                        Key::Backspace => {
-                            input_str.pop();
-                        }
-                        _ => {}
+                    match app.curr_mode {
+                        InputMode::Normal => match input {
+                            Key::F(1) => {
+                                return Ok(());
+                            }
+                            Key::Char('\t') => {
+                                selected_block = match selected_block {
+                                    TBlocks::ChatList => TBlocks::CurrChat,
+                                    TBlocks::CurrChat => TBlocks::Input,
+                                    TBlocks::Input => TBlocks::ChatList,
+                                }
+                            }
+                            Key::Esc => {}
+                            /*
+                            Key::Char(c) => {
+                                input_str.push(c);
+                            }
+                            Key::Backspace => {
+                                input_str.pop();
+                            }
+                            */
+                            _ => {
+                                if DO_DEBUG {
+                                    terminal.clear();
+                                }
+                                match selected_block {
+                                    TBlocks::ChatList => {
+                                        chat_list.handle_input_normal(&ui_outgoing_queue, &input)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                        InputMode::Insert => match input {
+                            Key::Esc => {
+                                app.curr_mode = InputMode::Normal;
+                            }
+                            _ => match selected_block {
+                                TBlocks::ChatList => {
+                                    chat_list.handle_input_insert(&ui_outgoing_queue, &input)
+                                }
+                                _ => {}
+                            },
+                        },
                     }
                 }
             }
@@ -291,6 +414,20 @@ fn setup_interface(tdlib: &Tdlib) {
         .limit(255)
         .build();
     tdlib.send(&chat_list_req.to_json().unwrap());
+}
+fn get_chat_by_id(chat_vec: &Vec<TChat>, chat_id: i64) -> &TChat {
+    let mut counter = 0;
+    loop {
+        let check_chat = chat_vec.get(counter).unwrap();
+        if check_chat.chat.id() == chat_id {
+            return check_chat;
+        }
+        if counter >= chat_vec.len() {
+            panic!("wrong chats");
+        } else {
+            counter += 1;
+        }
+    }
 }
 
 fn send_tdlib_parameters(tdlib: &Tdlib, api_id: i64, api_hash: &str) {
