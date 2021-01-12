@@ -3,7 +3,7 @@ use crossbeam::thread;
 use event::{Event, Events};
 use rtdlib::types::*;
 use rtdlib::Tdlib;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind};
 use std::sync::{Arc, Mutex};
@@ -20,8 +20,8 @@ use tui::{
 
 const TIMEOUT: f64 = 0.5;
 const DEBUG_LEVEL: i64 = 0;
-const NUM_BLOCKS: i32 = 3;
 const DO_DEBUG: bool = false;
+const NUM_CHATS: i64 = 20;
 
 enum InputMode {
     Normal,
@@ -35,6 +35,7 @@ enum TBlocks {
 struct App {
     curr_mode: InputMode,
     outgoing_queue: Arc<Mutex<VecDeque<String>>>,
+    users: Arc<Mutex<HashMap<i64, User>>>,
 }
 struct Chats {
     chat_vec: Arc<Mutex<Vec<TChat>>>,
@@ -43,9 +44,26 @@ struct Chats {
 }
 #[derive(Clone)]
 struct TChat {
-    history: Arc<Mutex<Vec<json::JsonValue>>>,
+    history: Arc<Mutex<Vec<Message>>>,
     chat: Chat,
 }
+
+impl TChat {
+    fn retrieve_history(&self, queue: &Arc<Mutex<VecDeque<String>>>, start_id: i64, limit: i64) {
+        let chat_history_req = GetChatHistory::builder()
+            .chat_id(self.chat.id())
+            .from_message_id(start_id)
+            .limit(limit)
+            .only_local(false)
+            .build();
+
+        queue
+            .lock()
+            .unwrap()
+            .push_back(chat_history_req.to_json().unwrap());
+    }
+}
+
 trait TBlock {
     fn new(name: &'static str) -> Self;
 
@@ -76,18 +94,7 @@ impl Chats {
             .get(index as usize)
             .unwrap()
             .clone();
-        let chat_history_req = GetChatHistory::builder()
-            .chat_id(curr_chat.chat.id())
-            .from_message_id(0)
-            .offset(0)
-            .limit(10)
-            .only_local(false)
-            .build();
-
-        queue
-            .lock()
-            .unwrap()
-            .push_back(chat_history_req.to_json().unwrap());
+        curr_chat.retrieve_history(queue, 0, NUM_CHATS);
     }
 }
 
@@ -146,9 +153,11 @@ fn main() -> io::Result<()> {
         let mut app = App {
             curr_mode: InputMode::Normal,
             outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
+            users: Arc::new(Mutex::new(HashMap::new())),
         };
         let rec_chat_vec = chat_list.chat_vec.clone();
         let rec_outgoing_queue = app.outgoing_queue.clone();
+        let rec_users = app.users.clone();
         let _rec_thread = s.spawn(move |_| {
             loop {
                 match tdlib.receive(TIMEOUT) {
@@ -157,7 +166,6 @@ fn main() -> io::Result<()> {
                         match obj["@type"].as_str().unwrap() {
                             "updateAuthorizationState" => {
                                 let astate = &obj["authorization_state"];
-                                println!("astate {}", &astate);
                                 match astate["@type"].as_str().unwrap() {
                                     "authorizationStateReady" => {
                                         //TODO: store auth credentials
@@ -187,7 +195,7 @@ fn main() -> io::Result<()> {
                                                 .expect("failed to read from stdin");
                                             */
 
-                                            let input_text = "91274";
+                                            let input_text = "66268";
 
                                             let check_auth_code =
                                                 CheckAuthenticationCode::builder()
@@ -199,6 +207,10 @@ fn main() -> io::Result<()> {
                                     }
                                 }
                             } // end updateAuthorizationState
+                            "updateUser" => {
+                                let new_user = User::from_json(obj["user"].to_string()).unwrap();
+                                rec_users.lock().unwrap().insert(new_user.id(), new_user);
+                            }
 
                             "updateNewChat" => {
                                 let new_chat = &mut obj["chat"].clone();
@@ -217,15 +229,40 @@ fn main() -> io::Result<()> {
                                 rec_chat_vec.lock().unwrap().push(tchat);
                             }
                             "messages" => {
-                                eprintln!("woopsy: {}", obj.to_string());
                                 let loc_rec_chat_vec = rec_chat_vec.lock().unwrap().clone();
                                 let msg_list = &mut obj["messages"].clone();
                                 let msg_count = &mut obj["total_count"].as_usize().unwrap();
                                 let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
-                                let mut counter = 0;
                                 let cur_chat = get_chat_by_id(&loc_rec_chat_vec, *chat_id);
+                                let mut cur_chat_history = cur_chat.history.lock().unwrap();
                                 for _ in 0..*msg_count {
-                                    cur_chat.history.lock().unwrap().push(msg_list.pop());
+                                    let mut cur_msg = msg_list.pop();
+                                    // ANOTHER WEIRD STOPGAP
+                                    cur_msg["sender_user_id"] =
+                                        cur_msg["sender"]["user_id"].clone();
+                                    cur_msg["views"] = json::JsonValue::from(1);
+                                    let cur_msg = match Message::from_json(cur_msg.to_string()) {
+                                        Err(e) => {
+                                            //eprintln!("woops: {}\n{}", e, cur_msg.to_string());
+                                            continue;
+                                        }
+                                        Ok(ok) => ok,
+                                    };
+                                    cur_chat_history.insert(0, cur_msg);
+                                }
+                                //Get more messages if less than minimum have been retrieved and there are some left
+                                if (cur_chat_history.len() as i64) < NUM_CHATS && *msg_count > 0 {
+                                    let start_id: i64 = cur_chat_history
+                                        [cur_chat_history.len() - 1]
+                                        .id()
+                                        .to_string()
+                                        .parse::<i64>()
+                                        .unwrap();
+                                    cur_chat.retrieve_history(
+                                        &rec_outgoing_queue,
+                                        start_id,
+                                        NUM_CHATS,
+                                    );
                                 }
                             }
                             _ => {
@@ -294,9 +331,11 @@ fn main() -> io::Result<()> {
                             if chat_list.selected_index == i {
                                 chat_list_item = chat_list_item.style(selected_style);
                                 for msg in chat.history.lock().unwrap().clone().into_iter() {
-                                    chat_history.push(ListItem::new(Text::from(
-                                        msg["content"]["text"]["text"].to_string(),
-                                    )));
+                                    let msg_text = match msg.content().as_message_text() {
+                                        Some(s) => s.text().text().to_string(),
+                                        None => "[none]".to_string(),
+                                    };
+                                    chat_history.insert(0, ListItem::new(msg_text));
                                 }
                             } else {
                                 chat_list_item = chat_list_item.style(unselected_style);
