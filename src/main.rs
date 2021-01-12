@@ -11,9 +11,9 @@ use std::vec;
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
     backend::TermionBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Corner, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Text,
+    text::{Span, Spans, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
@@ -22,6 +22,21 @@ const TIMEOUT: f64 = 0.5;
 const DEBUG_LEVEL: i64 = 0;
 const DO_DEBUG: bool = false;
 const NUM_CHATS: i64 = 20;
+const COLORS: [Color; 13] = [
+    Color::Red,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::Gray,
+    Color::LightRed,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightBlue,
+    Color::LightMagenta,
+    Color::LightCyan,
+];
 
 enum InputMode {
     Normal,
@@ -35,13 +50,19 @@ enum TBlocks {
 struct App {
     curr_mode: InputMode,
     outgoing_queue: Arc<Mutex<VecDeque<String>>>,
-    users: Arc<Mutex<HashMap<i64, User>>>,
+    users: Arc<Mutex<HashMap<i64, TUser>>>,
 }
 struct Chats {
     chat_vec: Arc<Mutex<Vec<TChat>>>,
     name: &'static str,
     selected_index: i32,
 }
+#[derive(Clone)]
+struct TUser {
+    u: User,
+    color: Color,
+}
+
 #[derive(Clone)]
 struct TChat {
     history: Arc<Mutex<Vec<Message>>>,
@@ -67,8 +88,8 @@ impl TChat {
 trait TBlock {
     fn new(name: &'static str) -> Self;
 
-    fn scroll_up(&mut self) {}
-    fn scroll_down(&mut self) {}
+    fn scroll_down(&mut self, queue: &Arc<Mutex<VecDeque<String>>>);
+    fn scroll_up(&mut self, queue: &Arc<Mutex<VecDeque<String>>>);
     fn get_len(&self) -> Result<i32, io::Error> {
         Ok(-1)
     }
@@ -94,7 +115,9 @@ impl Chats {
             .get(index as usize)
             .unwrap()
             .clone();
-        curr_chat.retrieve_history(queue, 0, NUM_CHATS);
+        if (curr_chat.history.lock().unwrap().len() as i64) < NUM_CHATS {
+            curr_chat.retrieve_history(queue, 0, NUM_CHATS);
+        }
     }
 }
 
@@ -115,14 +138,16 @@ impl TBlock for Chats {
             Ok(cur_size as i32)
         }
     }
-    fn scroll_up(&mut self) {
+    fn scroll_up(&mut self, queue: &Arc<Mutex<VecDeque<String>>>) {
         self.selected_index = (self.selected_index - 1) % self.get_len().unwrap();
         if self.selected_index < 0 {
             self.selected_index = self.get_len().unwrap() - 1;
         }
+        self.select_chat(self.selected_index, queue)
     }
-    fn scroll_down(&mut self) {
+    fn scroll_down(&mut self, queue: &Arc<Mutex<VecDeque<String>>>) {
         self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
+        self.select_chat(self.selected_index, queue)
     }
     fn handle_input_normal(
         &mut self,
@@ -130,9 +155,8 @@ impl TBlock for Chats {
         input: &termion::event::Key,
     ) {
         match input {
-            Key::Char('j') => self.scroll_down(),
-            Key::Char('k') => self.scroll_up(),
-            Key::Char('\n') => self.select_chat(self.selected_index, queue),
+            Key::Char('j') => self.scroll_down(queue),
+            Key::Char('k') => self.scroll_up(queue),
             _ => {}
         }
     }
@@ -195,7 +219,7 @@ fn main() -> io::Result<()> {
                                                 .expect("failed to read from stdin");
                                             */
 
-                                            let input_text = "66268";
+                                            let input_text = "69719";
 
                                             let check_auth_code =
                                                 CheckAuthenticationCode::builder()
@@ -208,8 +232,12 @@ fn main() -> io::Result<()> {
                                 }
                             } // end updateAuthorizationState
                             "updateUser" => {
-                                let new_user = User::from_json(obj["user"].to_string()).unwrap();
-                                rec_users.lock().unwrap().insert(new_user.id(), new_user);
+                                let num_users = rec_users.lock().unwrap().len();
+                                let new_user = TUser {
+                                    color: COLORS[num_users % COLORS.len()],
+                                    u: User::from_json(obj["user"].to_string()).unwrap(),
+                                };
+                                rec_users.lock().unwrap().insert(new_user.u.id(), new_user);
                             }
 
                             "updateNewChat" => {
@@ -232,37 +260,39 @@ fn main() -> io::Result<()> {
                                 let loc_rec_chat_vec = rec_chat_vec.lock().unwrap().clone();
                                 let msg_list = &mut obj["messages"].clone();
                                 let msg_count = &mut obj["total_count"].as_usize().unwrap();
-                                let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
-                                let cur_chat = get_chat_by_id(&loc_rec_chat_vec, *chat_id);
-                                let mut cur_chat_history = cur_chat.history.lock().unwrap();
-                                for _ in 0..*msg_count {
-                                    let mut cur_msg = msg_list.pop();
-                                    // ANOTHER WEIRD STOPGAP
-                                    cur_msg["sender_user_id"] =
-                                        cur_msg["sender"]["user_id"].clone();
-                                    cur_msg["views"] = json::JsonValue::from(1);
-                                    let cur_msg = match Message::from_json(cur_msg.to_string()) {
-                                        Err(e) => {
-                                            //eprintln!("woops: {}\n{}", e, cur_msg.to_string());
-                                            continue;
-                                        }
-                                        Ok(ok) => ok,
-                                    };
-                                    cur_chat_history.insert(0, cur_msg);
-                                }
-                                //Get more messages if less than minimum have been retrieved and there are some left
-                                if (cur_chat_history.len() as i64) < NUM_CHATS && *msg_count > 0 {
-                                    let start_id: i64 = cur_chat_history
-                                        [cur_chat_history.len() - 1]
-                                        .id()
-                                        .to_string()
-                                        .parse::<i64>()
-                                        .unwrap();
-                                    cur_chat.retrieve_history(
-                                        &rec_outgoing_queue,
-                                        start_id,
-                                        NUM_CHATS,
-                                    );
+                                if *msg_count > 0 {
+                                    let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
+                                    let cur_chat = get_chat_by_id(&loc_rec_chat_vec, *chat_id);
+                                    let mut cur_chat_history = cur_chat.history.lock().unwrap();
+                                    for cur_msg in msg_list.members_mut() {
+                                        // ANOTHER WEIRD STOPGAP
+                                        cur_msg["sender_user_id"] =
+                                            cur_msg["sender"]["user_id"].clone();
+                                        cur_msg["views"] = json::JsonValue::from(1);
+                                        let cur_msg = match Message::from_json(cur_msg.to_string())
+                                        {
+                                            Err(e) => {
+                                                eprintln!("woops: {}\n{}", e, cur_msg.to_string());
+                                                Message::builder().chat_id(*chat_id).build()
+                                            }
+                                            Ok(ok) => ok,
+                                        };
+                                        cur_chat_history.insert(0, cur_msg);
+                                    }
+                                    //Get more messages if less than minimum have been retrieved and there are some left
+                                    if (cur_chat_history.len() as i64) < NUM_CHATS && *msg_count > 0
+                                    {
+                                        let start_id: i64 = cur_chat_history[0]
+                                            .id()
+                                            .to_string()
+                                            .parse::<i64>()
+                                            .unwrap();
+                                        cur_chat.retrieve_history(
+                                            &rec_outgoing_queue,
+                                            start_id,
+                                            NUM_CHATS,
+                                        );
+                                    }
                                 }
                             }
                             _ => {
@@ -277,6 +307,7 @@ fn main() -> io::Result<()> {
                         let sz = rec_outgoing_queue.lock().unwrap().len();
                         for _ in 0..sz {
                             let s = rec_outgoing_queue.lock().unwrap().pop_front().unwrap();
+                            eprintln!("request: {}", s);
                             tdlib.send(&s);
                         }
                     }
@@ -287,6 +318,7 @@ fn main() -> io::Result<()> {
         let events = Events::new();
         let ui_chat_vec = chat_list.chat_vec.clone();
         let ui_outgoing_queue = app.outgoing_queue.clone();
+        let ui_users = app.users.clone();
         {
             let stdout = io::stdout().into_raw_mode()?;
             let stdout = MouseTerminal::from(stdout);
@@ -324,6 +356,7 @@ fn main() -> io::Result<()> {
                     let mut chat_history = vec::Vec::new();
                     {
                         let local_chat_vec = ui_chat_vec.lock().unwrap().clone();
+                        let loc_ui_users = ui_users.lock().unwrap();
                         for i in 0..chat_list.get_len().unwrap() {
                             let chat = local_chat_vec.get(i as usize).unwrap();
                             let mut chat_list_item =
@@ -335,7 +368,57 @@ fn main() -> io::Result<()> {
                                         Some(s) => s.text().text().to_string(),
                                         None => "[none]".to_string(),
                                     };
-                                    chat_history.insert(0, ListItem::new(msg_text));
+                                    let (sender_name, sender_color) =
+                                        match loc_ui_users.get(&msg.sender_user_id()) {
+                                            Some(u) => (&u.u.first_name()[..], u.color),
+                                            None => ("Unknown User", COLORS[0]),
+                                        };
+                                    let sender_name = sender_name.to_owned() + ": ";
+                                    let send_len = sender_name.len();
+                                    let chat_box_width: usize =
+                                        (chat_chunks[1].right() - chat_chunks[1].left() - 2).into();
+                                    let mut newline_index = chat_box_width;
+                                    let mut first_line = vec![Span::styled(
+                                        sender_name,
+                                        Style::default().fg(sender_color),
+                                    )];
+                                    let text_style = Style::default().fg(Color::White);
+
+                                    let mut rest_of_message = Text::from("");
+                                    let mut last_index = 0;
+                                    while newline_index < send_len + msg_text.len() - 1 {
+                                        //Break on word
+                                        while msg_text
+                                            .chars()
+                                            .nth(newline_index - send_len)
+                                            .unwrap()
+                                            != ' '
+                                            && newline_index > 0
+                                        {
+                                            newline_index -= 1;
+                                        }
+                                        let replace_index = newline_index - send_len;
+                                        let msg_slice =
+                                            msg_text[last_index..replace_index].to_owned();
+                                        if last_index == 0 {
+                                            first_line.push(Span::styled(msg_slice, text_style));
+                                        } else {
+                                            rest_of_message
+                                                .extend(Text::styled(msg_slice, text_style));
+                                        }
+                                        last_index = replace_index + 1;
+                                        newline_index = last_index + chat_box_width;
+                                    }
+                                    let msg_slice = msg_text[last_index..].to_owned();
+                                    if last_index == 0 {
+                                        first_line.push(Span::styled(msg_slice, text_style));
+                                    } else {
+                                        rest_of_message.extend(Text::from(msg_slice));
+                                    }
+
+                                    let mut formatted_msg = Text::from(Spans::from(first_line));
+                                    formatted_msg.extend(rest_of_message);
+                                    chat_history.push(ListItem::new(formatted_msg));
                                 }
                             } else {
                                 chat_list_item = chat_list_item.style(unselected_style);
@@ -348,7 +431,8 @@ fn main() -> io::Result<()> {
                     let mut chats_block = List::new(chat_titles)
                         .block(Block::default().title(chat_list.name).borders(Borders::ALL));
                     let mut chat_block = List::new(chat_history)
-                        .block(Block::default().title("Current Chat").borders(Borders::ALL));
+                        .block(Block::default().title("Current Chat").borders(Borders::ALL))
+                        .start_corner(Corner::BottomRight);
 
                     let mut input_block = Block::default().title("Input").borders(Borders::ALL);
                     let input = Paragraph::new(input_str.as_ref())
