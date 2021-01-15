@@ -21,8 +21,7 @@ use tui::{
 
 const TIMEOUT: f64 = 0.5;
 const DEBUG_LEVEL: i64 = 0;
-const DO_DEBUG: bool = true;
-const NUM_CHATS: i64 = 25;
+const DO_DEBUG: bool = false;
 const CODE_ARG: &str = "--code=";
 const COLORS: [Color; 13] = [
     Color::Red,
@@ -74,7 +73,9 @@ struct TChat {
     history: Arc<Mutex<Vec<Message>>>,
     chat: Chat,
     end_of_history: bool,
-    retrieving: bool,
+    retrieving: i64,
+    viewport_height: usize,
+    bottom_index: usize,
 }
 impl App {}
 
@@ -103,7 +104,17 @@ impl TChat {
         if hc.len() == 0 {
             return 0;
         }
-        hc[hc.len() - 1].id().to_string().parse::<i64>().unwrap()
+        hc[0].id().to_string().parse::<i64>().unwrap()
+    }
+    fn from_json(j: String) -> TChat {
+        TChat {
+            chat: Chat::from_json(j).unwrap(),
+            history: Arc::new(Mutex::new(Vec::new())),
+            end_of_history: false,
+            retrieving: -1,
+            viewport_height: 0,
+            bottom_index: 0,
+        }
     }
 }
 
@@ -124,11 +135,25 @@ trait TBlock {
     fn handle_input_normal(
         &mut self,
         _queue: &Arc<Mutex<VecDeque<String>>>,
-        _input: &termion::event::Key,
+        input: &termion::event::Key,
     ) {
+        match input {
+            Key::Char('j') => self.scroll_down(),
+            Key::Char('k') => self.scroll_up(),
+            _ => {}
+        }
     }
 }
-impl Chats {}
+impl Chats {
+    fn get_chat_by_id(&mut self, chat_id: i64) -> Option<TChat> {
+        for chat in self.chat_vec.clone().lock().unwrap().iter() {
+            if chat.chat.id() == chat_id {
+                return Some(chat.clone());
+            }
+        }
+        None
+    }
+}
 
 impl TBlock for Chats {
     fn new(name: &'static str) -> Chats {
@@ -156,16 +181,27 @@ impl TBlock for Chats {
     fn scroll_down(&mut self) {
         self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
     }
-    fn handle_input_normal(
-        &mut self,
-        _queue: &Arc<Mutex<VecDeque<String>>>,
-        input: &termion::event::Key,
-    ) {
-        match input {
-            Key::Char('j') => self.scroll_down(),
-            Key::Char('k') => self.scroll_up(),
-            _ => {}
+}
+impl TBlock for TChat {
+    fn new(_name: &'static str) -> TChat {
+        TChat {
+            chat: Chat::builder().build(),
+            history: Arc::new(Mutex::new(Vec::new())),
+            end_of_history: false,
+            retrieving: -1,
+            viewport_height: 0,
+            bottom_index: 0,
         }
+    }
+    fn scroll_up(&mut self) {
+        self.bottom_index += self.viewport_height;
+    }
+    fn scroll_down(&mut self) {
+        if (self.bottom_index as i64 - self.viewport_height as i64) < 0 {
+            self.bottom_index = 0;
+            return;
+        }
+        self.bottom_index -= self.viewport_height;
     }
 }
 
@@ -184,9 +220,9 @@ fn main() {
             users: Arc::new(Mutex::new(HashMap::new())),
             chat_list: Chats::new("Chats"),
         };
-        let rec_app = app.clone();
+        let mut rec_app = app.clone();
         let _rec_thread = s.spawn(move |_| {
-            td_thread(&tdlib, rec_app);
+            td_thread(&tdlib, &mut rec_app);
         });
 
         let ui_app = app.clone();
@@ -225,21 +261,6 @@ fn setup_interface(tdlib: &Tdlib) {
         .limit(255)
         .build();
     tdlib.send(&chat_list_req.to_json().unwrap());
-}
-fn get_chat_by_id(app: &App, chat_id: i64) -> TChat {
-    let mut counter = 0;
-    let chat_vec = app.chat_list.chat_vec.lock().unwrap();
-    loop {
-        let check_chat = chat_vec.get(counter).unwrap();
-        if check_chat.chat.id() == chat_id {
-            return check_chat.clone();
-        }
-        if counter >= chat_vec.len() {
-            panic!("wrong chats");
-        } else {
-            counter += 1;
-        }
-    }
 }
 
 fn send_tdlib_parameters(tdlib: &Tdlib, api_id: i64, api_hash: &str) {
@@ -285,7 +306,7 @@ fn _send_registration(tdlib: &Tdlib, first_name: &str, last_name: &str) {
     tdlib.send(&reg.to_json().unwrap());
 }
 
-fn td_thread(tdlib: &Tdlib, app: App) {
+fn td_thread(tdlib: &Tdlib, app: &mut App) {
     let (api_id, api_hash, phone_number) = read_info().unwrap();
     loop {
         match tdlib.receive(TIMEOUT) {
@@ -359,19 +380,14 @@ fn td_thread(tdlib: &Tdlib, app: App) {
                         new_chat["pinned_message_id"] = json::JsonValue::from(0);
                         //END WEIRD STOPGAP
 
-                        let tchat = TChat {
-                            chat: Chat::from_json(new_chat.to_string()).unwrap(),
-                            history: Arc::new(Mutex::new(Vec::new())),
-                            end_of_history: false,
-                            retrieving: false,
-                        };
+                        let tchat = TChat::from_json(new_chat.to_string());
                         app.chat_list.chat_vec.lock().unwrap().push(tchat);
                     }
                     "messages" => {
                         let msg_list = &mut obj["messages"].clone();
                         let msg_count = &mut obj["total_count"].as_usize().unwrap();
                         let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
-                        let mut cur_chat = get_chat_by_id(&app, *chat_id);
+                        let cur_chat = &mut app.chat_list.get_chat_by_id(*chat_id).unwrap();
                         if *msg_count > 0 {
                             let mut cur_chat_history = cur_chat.history.lock().unwrap();
                             for cur_msg in msg_list.members_mut() {
@@ -390,7 +406,6 @@ fn td_thread(tdlib: &Tdlib, app: App) {
                         } else {
                             cur_chat.end_of_history = true;
                         }
-                        cur_chat.retrieving = false;
                     }
                     _ => {}
                 }
@@ -443,11 +458,10 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
             let mut chat_titles = vec::Vec::new();
             let mut chat_history = vec::Vec::new();
             let ui_users = app.users.lock().unwrap();
-            for (i, mut chat) in (*app.chat_list.chat_vec)
+            for (i, chat) in (app.chat_list.chat_vec)
                 .lock()
                 .unwrap()
-                .clone()
-                .into_iter()
+                .iter_mut()
                 .enumerate()
             {
                 let chat_list_item = ListItem::new(Text::from(String::from(chat.chat.title())));
@@ -458,7 +472,21 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
                 }
                 chat_titles.push(chat_list_item.style(selected_style));
                 let mut history_height = 0;
-                for msg in chat.history.lock().unwrap().clone().into_iter() {
+                eprintln!("start loop");
+                let hlen = chat.history.lock().unwrap().len();
+                let mut displayed_msgs = 0;
+                for (msg_index, msg) in chat.history.lock().unwrap()[..(hlen - chat.bottom_index)]
+                    .iter()
+                    .enumerate()
+                {
+                    if chat.bottom_index > 10 {
+                        eprintln!(
+                            "{} of {}, messages: {:?}",
+                            msg_index,
+                            chat.bottom_index,
+                            msg.content()
+                        );
+                    }
                     let msg_text = match msg.content().as_message_text() {
                         Some(s) => s.text().text().to_string(),
                         None => "[none]".to_string(),
@@ -515,18 +543,22 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
                     formatted_msg.extend(rest_of_message);
                     let li = ListItem::new(formatted_msg);
                     history_height += li.height();
+                    if history_height <= chat_box_height {
+                        displayed_msgs += 1;
+                    } else {
+                        eprintln!("not displaying {}", msg_text);
+                    }
                     chat_history.insert(0, li);
                 }
+                chat.viewport_height = displayed_msgs;
+                //TODO: fix end of history
+                let oldest_id = chat.get_oldest_id();
                 if history_height < chat_box_height.into()
                     && !chat.end_of_history
-                    && !chat.retrieving
+                    && chat.retrieving != oldest_id
                 {
-                    chat.retrieve_history(
-                        &app.outgoing_queue,
-                        chat.get_oldest_id(),
-                        chat_box_height.into(),
-                    );
-                    chat.retrieving = true;
+                    chat.retrieving = oldest_id;
+                    chat.retrieve_history(&app.outgoing_queue, oldest_id, chat_box_height as i64);
                 }
             }
 
@@ -553,7 +585,7 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
             f.render_widget(chats_block, chat_chunks[0]);
             f.render_widget(chat_block, chat_chunks[1]);
             f.render_widget(input, chunks[1]);
-            chat_box_height = chat_chunks[1].top() - chat_chunks[1].bottom();
+            chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top()).into();
             chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2).into();
         })?;
         let enext = match events.next() {
@@ -583,9 +615,19 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
                     }
                     */
                     _ => match selected_block {
-                        TBlocks::ChatList => app
-                            .chat_list
-                            .handle_input_normal(&app.outgoing_queue, &input),
+                        TBlocks::ChatList => {
+                            app.chat_list
+                                .handle_input_normal(&app.outgoing_queue, &input);
+                        }
+                        TBlocks::CurrChat => {
+                            app.chat_list
+                                .chat_vec
+                                .lock()
+                                .unwrap()
+                                .get_mut(app.chat_list.selected_index as usize)
+                                .unwrap()
+                                .handle_input_normal(&app.outgoing_queue, &input);
+                        }
                         _ => {}
                     },
                 },
