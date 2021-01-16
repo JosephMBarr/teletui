@@ -1,4 +1,4 @@
-//TODO: agree to terms of service!!
+// TODO: figure out how to scroll down properly
 mod event;
 use crossbeam::thread;
 use event::{Event, Events};
@@ -20,9 +20,11 @@ use tui::{
 };
 
 const TIMEOUT: f64 = 0.5;
+const MARGIN: u16 = 1;
 const DEBUG_LEVEL: i64 = 0;
 const DO_DEBUG: bool = false;
 const CODE_ARG: &str = "--code=";
+const NO_CODE_PROVIDED: &str = "Please re-run with --code={{code}}";
 const COLORS: [Color; 13] = [
     Color::Red,
     Color::Green,
@@ -104,7 +106,7 @@ impl TChat {
         if hc.len() == 0 {
             return 0;
         }
-        hc[0].id().to_string().parse::<i64>().unwrap()
+        hc[hc.len() - 1].id().to_string().parse::<i64>().unwrap()
     }
     fn from_json(j: String) -> TChat {
         TChat {
@@ -214,7 +216,7 @@ fn main() {
 
     //Main listening loop
     thread::scope(|s| {
-        let app = App {
+        let mut app = App {
             curr_mode: InputMode::Normal,
             outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
             users: Arc::new(Mutex::new(HashMap::new())),
@@ -225,8 +227,7 @@ fn main() {
             td_thread(&tdlib, &mut rec_app);
         });
 
-        let ui_app = app.clone();
-        ui_thread(ui_app).unwrap();
+        ui_thread(&mut app).unwrap();
     })
     .unwrap();
 }
@@ -311,7 +312,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
     loop {
         match tdlib.receive(TIMEOUT) {
             Some(res) => {
-                let obj = json::parse(&res).unwrap();
+                let mut obj = json::parse(&res).unwrap();
                 if DO_DEBUG {
                     eprintln!("Received: {}", obj);
                 }
@@ -321,7 +322,6 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         match astate["@type"].as_str().unwrap() {
                             "authorizationStateReady" => {
                                 //TODO: store auth credentials
-                                eprintln!("ready!");
                                 setup_interface(&tdlib);
                             }
                             "authorizationStateWaitTdlibParameters" => {
@@ -333,31 +333,23 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                             "authorizationStateWaitPhoneNumber" => {
                                 send_phone_parameters(&tdlib, &phone_number);
                             }
-                            _ => {
-                                if astate.has_key("code_info")
-                                    && astate["code_info"].has_key("type")
-                                {
-                                    let mut got_code = false;
-                                    for arg in std::env::args() {
-                                        if arg[..CODE_ARG.len()] == *CODE_ARG {
-                                            let input_code =
-                                                arg.split("=").collect::<Vec<&str>>()[1];
-                                            eprintln!("code was {}", input_code);
-                                            got_code = true;
-                                            let check_auth_code =
-                                                CheckAuthenticationCode::builder()
-                                                    .code(input_code.trim())
-                                                    .build();
-
-                                            tdlib.send(&check_auth_code.to_json().unwrap());
-                                            continue;
-                                        }
-                                    }
-                                    if !got_code {
-                                        println!("Please re-run with --code={{code}}");
+                            "authorizationStateWaitCode" => {
+                                let input_code = match get_arg(CODE_ARG) {
+                                    Some(c) => c,
+                                    None => {
+                                        println!("{}", NO_CODE_PROVIDED);
                                         return;
                                     }
-                                }
+                                };
+                                let check_auth_code = CheckAuthenticationCode::builder()
+                                    .code(input_code.trim())
+                                    .build();
+
+                                tdlib.send(&check_auth_code.to_json().unwrap());
+                                break;
+                            }
+                            _ => {
+                                eprintln!("unhandled auth case!: {}", astate);
                             }
                         }
                     } // end updateAuthorizationState
@@ -371,7 +363,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                     }
 
                     "updateNewChat" => {
-                        let new_chat = &mut obj["chat"].clone();
+                        let new_chat = &mut obj["chat"];
 
                         // BEGIN WEIRD STOPGAP I SHOULD PROBABLY RESOLVE
                         new_chat["order"] = json::JsonValue::from("1");
@@ -384,15 +376,15 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         app.chat_list.chat_vec.lock().unwrap().push(tchat);
                     }
                     "messages" => {
-                        let msg_list = &mut obj["messages"].clone();
-                        let msg_count = &mut obj["total_count"].as_usize().unwrap();
+                        let msg_count = obj["total_count"].as_usize().unwrap();
+                        let msg_list = &mut obj["messages"];
                         let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
                         let cur_chat = &mut app.chat_list.get_chat_by_id(*chat_id).unwrap();
-                        if *msg_count > 0 {
+                        if msg_count > 0 {
                             let mut cur_chat_history = cur_chat.history.lock().unwrap();
                             for cur_msg in msg_list.members_mut() {
                                 // ANOTHER WEIRD STOPGAP
-                                cur_msg["sender_user_id"] = cur_msg["sender"]["user_id"].clone();
+                                cur_msg["sender_user_id"] = cur_msg["sender"]["user_id"].to_owned();
                                 cur_msg["views"] = json::JsonValue::from(1);
                                 let cur_msg = match Message::from_json(cur_msg.to_string()) {
                                     Err(e) => {
@@ -401,7 +393,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                     }
                                     Ok(ok) => ok,
                                 };
-                                cur_chat_history.insert(0, cur_msg);
+                                cur_chat_history.push(cur_msg);
                             }
                         } else {
                             cur_chat.end_of_history = true;
@@ -415,7 +407,6 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                 let sz = app.outgoing_queue.lock().unwrap().len();
                 for _ in 0..sz {
                     let s = app.outgoing_queue.lock().unwrap().pop_front().unwrap();
-                    eprintln!("request: {}", s);
                     tdlib.send(&s);
                 }
             }
@@ -423,7 +414,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
     }
 }
 
-fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
+fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
     let selected_style: Style = Style::default()
         .fg(Color::Blue)
         .add_modifier(Modifier::BOLD);
@@ -447,17 +438,19 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .margin(1)
+                .margin(MARGIN)
                 .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
                 .split(size);
             let chat_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .margin(1)
+                .margin(MARGIN)
                 .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
                 .split(chunks[0]);
             let mut chat_titles = vec::Vec::new();
-            let mut chat_history = vec::Vec::new();
             let ui_users = app.users.lock().unwrap();
+            chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top() - 2 * MARGIN).into();
+            chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2 * MARGIN).into();
+            let mut chat_history = vec::Vec::new();
             for (i, chat) in (app.chat_list.chat_vec)
                 .lock()
                 .unwrap()
@@ -470,86 +463,14 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
                     chat_titles.push(chat_list_item.style(unselected_style));
                     continue;
                 }
+                let (displayed_msgs, history_height) = build_msg_list(
+                    &chat,
+                    &ui_users,
+                    chat_box_width,
+                    chat_box_height,
+                    &mut chat_history,
+                );
                 chat_titles.push(chat_list_item.style(selected_style));
-                let mut history_height = 0;
-                eprintln!("start loop");
-                let hlen = chat.history.lock().unwrap().len();
-                let mut displayed_msgs = 0;
-                for (msg_index, msg) in chat.history.lock().unwrap()[..(hlen - chat.bottom_index)]
-                    .iter()
-                    .enumerate()
-                {
-                    if chat.bottom_index > 10 {
-                        eprintln!(
-                            "{} of {}, messages: {:?}",
-                            msg_index,
-                            chat.bottom_index,
-                            msg.content()
-                        );
-                    }
-                    let msg_text = match msg.content().as_message_text() {
-                        Some(s) => s.text().text().to_string(),
-                        None => "[none]".to_string(),
-                    };
-                    let (sender_name, sender_color) = match ui_users.get(&msg.sender_user_id()) {
-                        Some(u) => (&u.u.first_name()[..], u.color),
-                        None => ("Unknown User", COLORS[0]),
-                    };
-                    let sender_name = sender_name.to_owned() + ": ";
-                    let send_len = sender_name.len();
-                    let mut newline_index = chat_box_width;
-                    let mut first_line = vec![Span::styled(
-                        sender_name,
-                        Style::default()
-                            .remove_modifier(Modifier::BOLD)
-                            .fg(sender_color),
-                    )];
-                    let text_style = Style::default()
-                        .remove_modifier(Modifier::BOLD)
-                        .fg(Color::White);
-
-                    let mut rest_of_message = Text::from("");
-                    let mut last_index = 0;
-                    while newline_index < send_len + msg_text.len() - 1 {
-                        //Break on word
-                        while msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
-                            && newline_index > 0
-                        {
-                            newline_index -= 1;
-                        }
-                        let replace_index = newline_index - send_len;
-                        let msg_slice: String = msg_text
-                            .chars()
-                            .take(replace_index)
-                            .skip(last_index)
-                            .collect();
-                        if last_index == 0 {
-                            first_line.push(Span::styled(msg_slice, text_style));
-                        } else {
-                            rest_of_message.extend(Text::styled(msg_slice, text_style));
-                        }
-                        last_index = replace_index + 1;
-                        newline_index = last_index + chat_box_width;
-                    }
-                    let msg_slice: String = msg_text.chars().skip(last_index).collect();
-                    if last_index == 0 {
-                        first_line.push(Span::styled(msg_slice, text_style));
-                    } else {
-                        rest_of_message.extend(Text::styled(msg_slice, text_style));
-                    }
-
-                    let mut formatted_msg = Text::from(Spans::from(first_line));
-
-                    formatted_msg.extend(rest_of_message);
-                    let li = ListItem::new(formatted_msg);
-                    history_height += li.height();
-                    if history_height <= chat_box_height {
-                        displayed_msgs += 1;
-                    } else {
-                        eprintln!("not displaying {}", msg_text);
-                    }
-                    chat_history.insert(0, li);
-                }
                 chat.viewport_height = displayed_msgs;
                 //TODO: fix end of history
                 let oldest_id = chat.get_oldest_id();
@@ -585,8 +506,6 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
             f.render_widget(chats_block, chat_chunks[0]);
             f.render_widget(chat_block, chat_chunks[1]);
             f.render_widget(input, chunks[1]);
-            chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top()).into();
-            chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2).into();
         })?;
         let enext = match events.next() {
             Ok(eve) => eve,
@@ -645,4 +564,101 @@ fn ui_thread(mut app: App) -> Result<(), std::io::Error> {
             }
         }
     }
+}
+/*
+ * Build the message list to be displayed, based on size parameters of chat box
+ */
+
+fn build_msg_list(
+    chat: &TChat,
+    ui_users: &HashMap<i64, TUser>,
+    chat_box_width: usize,
+    chat_box_height: usize,
+    chat_history: &mut Vec<ListItem>,
+) -> (usize, usize) {
+    // Track total line height of displayed messages
+    let mut history_height = 0;
+
+    // Track total number of messages displayed, for tracking scroll
+    let mut displayed_msgs = 0;
+
+    // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
+    for msg in chat.history.lock().unwrap()[chat.bottom_index..].iter() {
+        //TODO: handle more message types
+        let msg_text = match msg.content().as_message_text() {
+            Some(s) => s.text().text().to_string(),
+            None => "[none]".to_string(),
+        };
+        let (sender_name, sender_color) = match ui_users.get(&msg.sender_user_id()) {
+            Some(u) => (&u.u.first_name()[..], u.color),
+            None => ("Unknown User", COLORS[0]),
+        };
+        let sender_name = sender_name.to_owned() + ": ";
+        let send_len = sender_name.len();
+        let mut newline_index = chat_box_width;
+        let mut first_line = vec![Span::styled(
+            sender_name,
+            Style::default()
+                .remove_modifier(Modifier::BOLD)
+                .fg(sender_color),
+        )];
+        let text_style = Style::default()
+            .remove_modifier(Modifier::BOLD)
+            .fg(Color::White);
+
+        let mut rest_of_message = Text::from("");
+        let mut last_index = 0;
+        while newline_index < send_len + msg_text.len() - 1 {
+            //Break on word
+            while msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
+                && newline_index > 0
+            {
+                newline_index -= 1;
+            }
+            let replace_index = newline_index - send_len;
+            let msg_slice: String = msg_text
+                .chars()
+                .take(replace_index)
+                .skip(last_index)
+                .collect();
+            if last_index == 0 {
+                first_line.push(Span::styled(msg_slice, text_style));
+            } else {
+                rest_of_message.extend(Text::styled(msg_slice, text_style));
+            }
+            last_index = replace_index + 1;
+            newline_index = last_index + chat_box_width;
+        }
+        let msg_slice: String = msg_text.chars().skip(last_index).collect();
+        if last_index == 0 {
+            first_line.push(Span::styled(msg_slice, text_style));
+        } else {
+            rest_of_message.extend(Text::styled(msg_slice, text_style));
+        }
+
+        let mut formatted_msg = Text::from(Spans::from(first_line));
+
+        formatted_msg.extend(rest_of_message);
+        let li = ListItem::new(formatted_msg);
+        if history_height + li.height() <= chat_box_height {
+            displayed_msgs += 1;
+        } else {
+            break;
+        }
+        history_height += li.height();
+        chat_history.push(li);
+    }
+    return (displayed_msgs, history_height);
+}
+/*
+ *   Get specified command line argument
+ */
+
+fn get_arg(arg_name: &str) -> Option<String> {
+    for arg in std::env::args() {
+        if &arg[..arg_name.len()] == arg_name {
+            return Some(arg.split("=").collect::<Vec<&str>>()[1].trim().to_string());
+        }
+    }
+    None
 }
