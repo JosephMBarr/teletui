@@ -42,6 +42,11 @@ const COLORS: [Color; 13] = [
 ];
 
 #[derive(Clone)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+#[derive(Clone)]
 enum InputMode {
     Normal,
     _Insert,
@@ -78,6 +83,7 @@ struct TChat {
     retrieving: i64,
     viewport_height: usize,
     bottom_index: usize,
+    last_scroll_direction: ScrollDirection,
 }
 impl App {}
 
@@ -116,6 +122,7 @@ impl TChat {
             retrieving: -1,
             viewport_height: 0,
             bottom_index: 0,
+            last_scroll_direction: ScrollDirection::Up,
         }
     }
 }
@@ -193,13 +200,21 @@ impl TBlock for TChat {
             retrieving: -1,
             viewport_height: 0,
             bottom_index: 0,
+            last_scroll_direction: ScrollDirection::Up,
         }
     }
     fn scroll_up(&mut self) {
+        self.last_scroll_direction = ScrollDirection::Up;
         self.bottom_index += self.viewport_height;
     }
+    //TODO: fiddle with scrolling off-by-one
     fn scroll_down(&mut self) {
-        if (self.bottom_index as i64 - self.viewport_height as i64) < 0 {
+        self.last_scroll_direction = ScrollDirection::Down;
+        eprintln!("bottom {} view {}", self.bottom_index, self.viewport_height);
+        if (self.bottom_index as i64 - self.viewport_height as i64) <= self.viewport_height as i64 {
+            self.last_scroll_direction = ScrollDirection::Up;
+        }
+        if (self.bottom_index as i64 - self.viewport_height as i64) <= 0 {
             self.bottom_index = 0;
             return;
         }
@@ -337,16 +352,17 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                 let input_code = match get_arg(CODE_ARG) {
                                     Some(c) => c,
                                     None => {
-                                        println!("{}", NO_CODE_PROVIDED);
+                                        eprintln!("{}", NO_CODE_PROVIDED);
                                         return;
                                     }
                                 };
+                                eprintln!("got code {}", input_code.trim());
                                 let check_auth_code = CheckAuthenticationCode::builder()
                                     .code(input_code.trim())
                                     .build();
 
                                 tdlib.send(&check_auth_code.to_json().unwrap());
-                                break;
+                                continue;
                             }
                             _ => {
                                 eprintln!("unhandled auth case!: {}", astate);
@@ -388,8 +404,46 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                 cur_msg["views"] = json::JsonValue::from(1);
                                 let cur_msg = match Message::from_json(cur_msg.to_string()) {
                                     Err(e) => {
-                                        eprintln!("woops: {}\n{}", e, cur_msg.to_string());
-                                        Message::builder().chat_id(*chat_id).build()
+                                        let msg_builder = &mut Message::builder();
+                                        let formatted_str =
+                                            match &cur_msg["content"]["@type"].to_string()[..] {
+                                                "messageSticker" => format!(
+                                                    "[{} Sticker]",
+                                                    cur_msg["content"]["sticker"]["emoji"]
+                                                ),
+                                                "messageText" => {
+                                                    if cur_msg["content"].has_key("web_page") {
+                                                        "url".to_owned()
+                                                    } else {
+                                                        "[none]".to_owned()
+                                                    }
+                                                }
+                                                _ => {
+                                                    eprintln!(
+                                                        "woops: {}\n{}",
+                                                        e,
+                                                        json::stringify_pretty(cur_msg.clone(), 2)
+                                                    );
+                                                    "[none]".to_owned()
+                                                }
+                                            };
+                                        msg_builder
+                                            .content(MessageContent::MessageText(
+                                                MessageText::builder()
+                                                    .text(
+                                                        FormattedText::builder()
+                                                            .text(formatted_str),
+                                                    )
+                                                    .build(),
+                                            ))
+                                            .chat_id(*chat_id)
+                                            .sender_user_id(
+                                                cur_msg["sender_user_id"]
+                                                    .to_string()
+                                                    .parse::<i64>()
+                                                    .unwrap(),
+                                            )
+                                            .build()
                                     }
                                     Ok(ok) => ok,
                                 };
@@ -432,6 +486,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
     let input_str = String::new();
     let mut chat_box_height = 0;
     let mut chat_box_width: usize = 0;
+    let mut start_corner = Corner::BottomLeft;
     loop {
         terminal.draw(|f| {
             let size = f.size();
@@ -481,6 +536,10 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     chat.retrieving = oldest_id;
                     chat.retrieve_history(&app.outgoing_queue, oldest_id, chat_box_height as i64);
                 }
+                start_corner = match chat.last_scroll_direction {
+                    ScrollDirection::Up => Corner::BottomLeft,
+                    ScrollDirection::Down => Corner::TopLeft,
+                };
             }
 
             let mut chats_block = List::new(chat_titles).block(
@@ -490,7 +549,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
             );
             let mut chat_block = List::new(chat_history)
                 .block(Block::default().title("Current Chat").borders(Borders::ALL))
-                .start_corner(Corner::BottomLeft);
+                .start_corner(start_corner);
 
             let mut input_block = Block::default().title("Input").borders(Borders::ALL);
             let input = Paragraph::new(input_str.as_ref())
@@ -582,8 +641,19 @@ fn build_msg_list(
     // Track total number of messages displayed, for tracking scroll
     let mut displayed_msgs = 0;
 
+    let h = chat.history.lock().unwrap();
+    let mut temp_vec = vec![Message::builder().build(); chat.bottom_index];
+    let chat_slice = match chat.last_scroll_direction {
+        ScrollDirection::Up => h[chat.bottom_index..].iter(),
+        ScrollDirection::Down => {
+            temp_vec.clone_from_slice(&h[..chat.bottom_index]);
+            temp_vec.reverse();
+            temp_vec.iter()
+        }
+    };
+
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
-    for msg in chat.history.lock().unwrap()[chat.bottom_index..].iter() {
+    for msg in chat_slice {
         //TODO: handle more message types
         let msg_text = match msg.content().as_message_text() {
             Some(s) => s.text().text().to_string(),
@@ -594,7 +664,7 @@ fn build_msg_list(
             None => ("Unknown User", COLORS[0]),
         };
         let sender_name = sender_name.to_owned() + ": ";
-        let send_len = sender_name.len();
+        let send_len = sender_name.chars().count();
         let mut newline_index = chat_box_width;
         let mut first_line = vec![Span::styled(
             sender_name,
@@ -608,7 +678,7 @@ fn build_msg_list(
 
         let mut rest_of_message = Text::from("");
         let mut last_index = 0;
-        while newline_index < send_len + msg_text.len() - 1 {
+        while newline_index < send_len + msg_text.chars().count() - 1 {
             //Break on word
             while msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
                 && newline_index > 0
