@@ -4,6 +4,7 @@ use crossbeam::thread;
 use event::{Event, Events};
 use rtdlib::types::*;
 use rtdlib::Tdlib;
+use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind};
@@ -327,9 +328,9 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
     loop {
         match tdlib.receive(TIMEOUT) {
             Some(res) => {
-                let mut obj = json::parse(&res).unwrap();
+                let mut obj: Value = serde_json::from_str(&res).unwrap();
                 if DO_DEBUG {
-                    eprintln!("Received: {}", obj);
+                    eprintln!("Received: {:?}", obj.get("@type"));
                 }
                 match obj["@type"].as_str().unwrap() {
                     "updateAuthorizationState" => {
@@ -382,48 +383,65 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         let new_chat = &mut obj["chat"];
 
                         // BEGIN WEIRD STOPGAP I SHOULD PROBABLY RESOLVE
-                        new_chat["order"] = json::JsonValue::from("1");
-                        new_chat["is_pinned"] = json::JsonValue::from(false);
-                        new_chat["is_sponsored"] = json::JsonValue::from(false);
-                        new_chat["pinned_message_id"] = json::JsonValue::from(0);
+                        new_chat["order"] = serde_json::from_str("1").unwrap();
+                        new_chat["is_pinned"] = serde_json::from_value(json!(false)).unwrap();
+                        new_chat["is_sponsored"] = serde_json::from_value(json!(false)).unwrap();
+                        new_chat["pinned_message_id"] = serde_json::from_value(json!(0)).unwrap();
                         //END WEIRD STOPGAP
 
                         let tchat = TChat::from_json(new_chat.to_string());
                         app.chat_list.chat_vec.lock().unwrap().push(tchat);
                     }
                     "messages" => {
-                        let msg_count = obj["total_count"].as_usize().unwrap();
+                        let msg_count = obj["total_count"].as_u64().unwrap();
                         let msg_list = &mut obj["messages"];
-                        let chat_id = &msg_list[0]["chat_id"].as_i64().unwrap();
-                        let cur_chat = &mut app.chat_list.get_chat_by_id(*chat_id).unwrap();
+                        let chat_id = match msg_list[0]["chat_id"].as_i64() {
+                            Some(ok) => ok,
+                            None => panic!("Couldn't get id: {}", msg_list),
+                        };
+                        let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
                         if msg_count > 0 {
                             let mut cur_chat_history = cur_chat.history.lock().unwrap();
-                            for cur_msg in msg_list.members_mut() {
+                            for cur_msg in msg_list.as_array_mut().unwrap() {
                                 // ANOTHER WEIRD STOPGAP
                                 cur_msg["sender_user_id"] = cur_msg["sender"]["user_id"].to_owned();
-                                cur_msg["views"] = json::JsonValue::from(1);
+                                cur_msg["views"] = json!(1);
                                 let cur_msg = match Message::from_json(cur_msg.to_string()) {
                                     Err(e) => {
                                         let msg_builder = &mut Message::builder();
                                         let formatted_str =
-                                            match &cur_msg["content"]["@type"].to_string()[..] {
-                                                "messageSticker" => format!(
-                                                    "[{} Sticker]",
-                                                    cur_msg["content"]["sticker"]["emoji"]
-                                                ),
+                                            match cur_msg["content"]["@type"].as_str().unwrap() {
+                                                "messageSticker" => {
+                                                    eprintln!("got a sticker!");
+                                                    format!(
+                                                        "[{} Sticker]",
+                                                        cur_msg["content"]["sticker"]["emoji"]
+                                                    )
+                                                }
+                                                //TODO: more type safety
                                                 "messageText" => {
-                                                    if cur_msg["content"].has_key("web_page") {
-                                                        "url".to_owned()
-                                                    } else {
-                                                        "[none]".to_owned()
+                                                    match cur_msg["content"].get("web_page") {
+                                                        Some(c) => {
+                                                            let wp =
+                                                                &cur_msg["content"]["web_page"];
+                                                            format!(
+                                                                "{}\n{}\n{}\n{}",
+                                                                cur_msg["content"]["text"]["text"]
+                                                                    .as_str()
+                                                                    .unwrap(),
+                                                                wp["site_name"].as_str().unwrap(),
+                                                                wp["title"].as_str().unwrap(),
+                                                                wp["description"]["text"]
+                                                                    .as_str()
+                                                                    .unwrap()
+                                                            )
+                                                        }
+
+                                                        None => "[none]".to_owned(),
                                                     }
                                                 }
-                                                _ => {
-                                                    eprintln!(
-                                                        "woops: {}\n{}",
-                                                        e,
-                                                        json::stringify_pretty(cur_msg.clone(), 2)
-                                                    );
+                                                t => {
+                                                    eprintln!("truly the type is {}", t);
                                                     "[none]".to_owned()
                                                 }
                                             };
@@ -436,7 +454,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                                     )
                                                     .build(),
                                             ))
-                                            .chat_id(*chat_id)
+                                            .chat_id(chat_id)
                                             .sender_user_id(
                                                 cur_msg["sender_user_id"]
                                                     .to_string()
@@ -678,14 +696,21 @@ fn build_msg_list(
 
         let mut rest_of_message = Text::from("");
         let mut last_index = 0;
-        while newline_index < send_len + msg_text.chars().count() - 1 {
+        while newline_index < send_len + msg_text.chars().count() {
+            let old_nl_index = newline_index;
             //Break on word
-            while msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
-                && newline_index > 0
+            while newline_index > send_len
+                && msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
             {
+                if msg_text.chars().nth(newline_index - send_len) == Some('\n') {
+                    break;
+                }
                 newline_index -= 1;
             }
-            let replace_index = newline_index - send_len;
+            let mut replace_index = newline_index - send_len;
+            if newline_index == send_len {
+                replace_index = old_nl_index - send_len;
+            }
             let msg_slice: String = msg_text
                 .chars()
                 .take(replace_index)
@@ -697,6 +722,9 @@ fn build_msg_list(
                 rest_of_message.extend(Text::styled(msg_slice, text_style));
             }
             last_index = replace_index + 1;
+            if newline_index == send_len {
+                last_index -= 1;
+            }
             newline_index = last_index + chat_box_width;
         }
         let msg_slice: String = msg_text.chars().skip(last_index).collect();

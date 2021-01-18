@@ -355,6 +355,7 @@ dependencies = [
  "json",
  "rand",
  "rtdlib",
+ "serde_json",
  "termion",
  "tui",
 ]
