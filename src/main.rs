@@ -1,4 +1,6 @@
 // TODO: figure out how to scroll down properly
+extern crate chrono;
+use chrono::prelude::*;
 mod event;
 use crossbeam::thread;
 use event::{Event, Events};
@@ -545,6 +547,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
             chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top() - 2 * MARGIN).into();
             chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2 * MARGIN).into();
             let mut chat_history = vec::Vec::new();
+            let mut chat_title = "Current Chat".to_owned();
             for (i, chat) in (app.chat_list.chat_vec)
                 .lock()
                 .unwrap()
@@ -579,6 +582,26 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     ScrollDirection::Up => Corner::BottomLeft,
                     ScrollDirection::Down => Corner::TopLeft,
                 };
+                let extra_info = if chat.chat.type_().is_private() {
+                    // Get user and the time they were last seen
+                    let recipient_id = chat.chat.type_().as_private().unwrap().user_id();
+                    let recipient = ui_users.get(&recipient_id).unwrap();
+                    let status = recipient.u.status();
+                    if status.is_online() {
+                        "online".to_string()
+                    } else if status.is_offline() {
+                        let date_time = NaiveDateTime::from_timestamp(
+                            status.as_offline().unwrap().was_online(),
+                            0,
+                        );
+                        format!("last seen {}", date_time)
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    "some group".to_string()
+                };
+                chat_title = format!("{}: {}", *chat.chat.title(), extra_info);
             }
 
             let mut chats_block = List::new(chat_titles).block(
@@ -587,7 +610,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     .borders(Borders::ALL),
             );
             let mut chat_block = List::new(chat_history)
-                .block(Block::default().title("Current Chat").borders(Borders::ALL))
+                .block(Block::default().title(chat_title).borders(Borders::ALL))
                 .start_corner(start_corner);
 
             let mut input_block = Block::default()

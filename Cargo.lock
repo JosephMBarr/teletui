@@ -357,6 +357,7 @@ dependencies = [
 name = "tele"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossbeam",
  "json",
  "rand",
