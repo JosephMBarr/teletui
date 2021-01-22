@@ -337,6 +337,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smawk"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1bc737c97d093feb72e67f4926d9b22d717ce8580cd25f0ce86d74e859c466d"
+
+[[package]]
 name = "syn"
 version = "1.0.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,6 +363,7 @@ dependencies = [
  "rtdlib",
  "serde_json",
  "termion",
+ "textwrap",
  "tui",
 ]
 
@@ -370,6 +377,16 @@ dependencies = [
  "numtoa",
  "redox_syscall",
  "redox_termios",
+]
+
+[[package]]
+name = "textwrap"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cdcf6b66102d38821c33eea2bf1e8b7bd738072171cbf8a0683fbb46fcb8b0b"
+dependencies = [
+ "smawk",
+ "unicode-width",
 ]
 
 [[package]]

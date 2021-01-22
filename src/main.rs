@@ -50,7 +50,7 @@ enum ScrollDirection {
 #[derive(Clone)]
 enum InputMode {
     Normal,
-    _Insert,
+    Insert,
 }
 enum TBlocks {
     ChatList,
@@ -63,6 +63,12 @@ struct App {
     outgoing_queue: Arc<Mutex<VecDeque<String>>>,
     users: Arc<Mutex<HashMap<i64, TUser>>>,
     chat_list: Chats,
+    input_box: InputBox,
+}
+#[derive(Clone)]
+struct InputBox {
+    input_str: String,
+    name: &'static str,
 }
 #[derive(Clone)]
 struct Chats {
@@ -131,8 +137,10 @@ impl TChat {
 trait TBlock {
     fn new(name: &'static str) -> Self;
 
-    fn scroll_down(&mut self);
-    fn scroll_up(&mut self);
+    fn scroll_down(&mut self) {}
+    fn scroll_up(&mut self) {}
+    fn page_down(&mut self) {}
+    fn page_up(&mut self) {}
     fn get_len(&self) -> Result<i32, io::Error> {
         Ok(-1)
     }
@@ -140,6 +148,7 @@ trait TBlock {
         &mut self,
         _queue: &Arc<Mutex<VecDeque<String>>>,
         _input: &termion::event::Key,
+        _cur_chat_id: i64,
     ) {
     }
     fn handle_input_normal(
@@ -150,6 +159,8 @@ trait TBlock {
         match input {
             Key::Char('j') => self.scroll_down(),
             Key::Char('k') => self.scroll_up(),
+            Key::Ctrl('f') => self.page_down(),
+            Key::Ctrl('b') => self.page_up(),
             _ => {}
         }
     }
@@ -165,6 +176,50 @@ impl Chats {
     }
 }
 
+impl InputBox {
+    fn send_message(&mut self, cur_chat_id: i64, queue: &Arc<Mutex<VecDeque<String>>>) {
+        let msg = InputMessageContent::InputMessageText(
+            InputMessageText::builder()
+                .text(FormattedText::builder().text(self.input_str.clone()))
+                .build(),
+        );
+        let req = SendMessage::builder()
+            .chat_id(cur_chat_id)
+            .input_message_content(msg)
+            .build();
+        queue.lock().unwrap().push_back(req.to_json().unwrap());
+        //TODO: Error checking
+        self.input_str.clear();
+    }
+}
+impl TBlock for InputBox {
+    fn new(name: &'static str) -> InputBox {
+        InputBox {
+            input_str: String::new(),
+            name: name,
+        }
+    }
+    fn handle_input_insert(
+        &mut self,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+        input: &termion::event::Key,
+        cur_chat_id: i64,
+    ) {
+        match input {
+            Key::Char('\n') => {
+                self.send_message(cur_chat_id, queue);
+            }
+            Key::Char(input) => {
+                self.input_str.push(*input);
+            }
+            Key::Backspace => {
+                self.input_str.pop();
+            }
+
+            _ => {}
+        }
+    }
+}
 impl TBlock for Chats {
     fn new(name: &'static str) -> Chats {
         Chats {
@@ -191,6 +246,8 @@ impl TBlock for Chats {
     fn scroll_down(&mut self) {
         self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
     }
+    fn page_down(&mut self) {}
+    fn page_up(&mut self) {}
 }
 impl TBlock for TChat {
     fn new(_name: &'static str) -> TChat {
@@ -204,14 +261,13 @@ impl TBlock for TChat {
             last_scroll_direction: ScrollDirection::Up,
         }
     }
-    fn scroll_up(&mut self) {
+    fn page_up(&mut self) {
         self.last_scroll_direction = ScrollDirection::Up;
         self.bottom_index += self.viewport_height;
     }
     //TODO: fiddle with scrolling off-by-one
-    fn scroll_down(&mut self) {
+    fn page_down(&mut self) {
         self.last_scroll_direction = ScrollDirection::Down;
-        eprintln!("bottom {} view {}", self.bottom_index, self.viewport_height);
         if (self.bottom_index as i64 - self.viewport_height as i64) <= self.viewport_height as i64 {
             self.last_scroll_direction = ScrollDirection::Up;
         }
@@ -220,6 +276,21 @@ impl TBlock for TChat {
             return;
         }
         self.bottom_index -= self.viewport_height;
+    }
+    fn scroll_up(&mut self) {
+        self.last_scroll_direction = ScrollDirection::Up;
+        self.bottom_index += 1;
+    }
+    fn scroll_down(&mut self) {
+        self.last_scroll_direction = ScrollDirection::Down;
+        if (self.bottom_index as i64 - self.viewport_height as i64) <= self.viewport_height as i64 {
+            self.last_scroll_direction = ScrollDirection::Up;
+        }
+        if self.bottom_index as i64 <= 0 {
+            self.bottom_index = 0;
+            return;
+        }
+        self.bottom_index -= 1;
     }
 }
 
@@ -237,6 +308,7 @@ fn main() {
             outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
             users: Arc::new(Mutex::new(HashMap::new())),
             chat_list: Chats::new("Chats"),
+            input_box: InputBox::new("Input"),
         };
         let mut rec_app = app.clone();
         let _rec_thread = s.spawn(move |_| {
@@ -354,16 +426,14 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                     Some(c) => c,
                                     None => {
                                         eprintln!("{}", NO_CODE_PROVIDED);
-                                        return;
+                                        std::process::exit(0);
                                     }
                                 };
-                                eprintln!("got code {}", input_code.trim());
                                 let check_auth_code = CheckAuthenticationCode::builder()
                                     .code(input_code.trim())
                                     .build();
 
                                 tdlib.send(&check_auth_code.to_json().unwrap());
-                                continue;
                             }
                             _ => {
                                 eprintln!("unhandled auth case!: {}", astate);
@@ -392,6 +462,19 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         let tchat = TChat::from_json(new_chat.to_string());
                         app.chat_list.chat_vec.lock().unwrap().push(tchat);
                     }
+                    "updateNewMessage" => {
+                        eprintln!("new message {}", obj);
+                        let msg = &mut obj["message"];
+                        let chat_id = match msg["chat_id"].as_i64() {
+                            Some(ok) => ok,
+                            None => panic!("Couldn't get id: {}", msg),
+                        };
+                        let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
+                        let mut cur_chat_history = cur_chat.history.lock().unwrap();
+                        let cur_msg = parse_msg(msg, chat_id);
+                        //place at start
+                        cur_chat_history.insert(0, cur_msg);
+                    }
                     "messages" => {
                         let msg_count = obj["total_count"].as_u64().unwrap();
                         let msg_list = &mut obj["messages"];
@@ -403,68 +486,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         if msg_count > 0 {
                             let mut cur_chat_history = cur_chat.history.lock().unwrap();
                             for cur_msg in msg_list.as_array_mut().unwrap() {
-                                // ANOTHER WEIRD STOPGAP
-                                cur_msg["sender_user_id"] = cur_msg["sender"]["user_id"].to_owned();
-                                cur_msg["views"] = json!(1);
-                                let cur_msg = match Message::from_json(cur_msg.to_string()) {
-                                    Err(e) => {
-                                        let msg_builder = &mut Message::builder();
-                                        let formatted_str =
-                                            match cur_msg["content"]["@type"].as_str().unwrap() {
-                                                "messageSticker" => {
-                                                    eprintln!("got a sticker!");
-                                                    format!(
-                                                        "[{} Sticker]",
-                                                        cur_msg["content"]["sticker"]["emoji"]
-                                                    )
-                                                }
-                                                //TODO: more type safety
-                                                "messageText" => {
-                                                    match cur_msg["content"].get("web_page") {
-                                                        Some(c) => {
-                                                            let wp =
-                                                                &cur_msg["content"]["web_page"];
-                                                            format!(
-                                                                "{}\n{}\n{}\n{}",
-                                                                cur_msg["content"]["text"]["text"]
-                                                                    .as_str()
-                                                                    .unwrap(),
-                                                                wp["site_name"].as_str().unwrap(),
-                                                                wp["title"].as_str().unwrap(),
-                                                                wp["description"]["text"]
-                                                                    .as_str()
-                                                                    .unwrap()
-                                                            )
-                                                        }
-
-                                                        None => "[none]".to_owned(),
-                                                    }
-                                                }
-                                                t => {
-                                                    eprintln!("truly the type is {}", t);
-                                                    "[none]".to_owned()
-                                                }
-                                            };
-                                        msg_builder
-                                            .content(MessageContent::MessageText(
-                                                MessageText::builder()
-                                                    .text(
-                                                        FormattedText::builder()
-                                                            .text(formatted_str),
-                                                    )
-                                                    .build(),
-                                            ))
-                                            .chat_id(chat_id)
-                                            .sender_user_id(
-                                                cur_msg["sender_user_id"]
-                                                    .to_string()
-                                                    .parse::<i64>()
-                                                    .unwrap(),
-                                            )
-                                            .build()
-                                    }
-                                    Ok(ok) => ok,
-                                };
+                                let cur_msg = parse_msg(cur_msg, chat_id);
                                 cur_chat_history.push(cur_msg);
                             }
                         } else {
@@ -501,7 +523,6 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
     let mut selected_block = TBlocks::ChatList;
 
     terminal.clear()?;
-    let input_str = String::new();
     let mut chat_box_height = 0;
     let mut chat_box_width: usize = 0;
     let mut start_corner = Corner::BottomLeft;
@@ -569,8 +590,10 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                 .block(Block::default().title("Current Chat").borders(Borders::ALL))
                 .start_corner(start_corner);
 
-            let mut input_block = Block::default().title("Input").borders(Borders::ALL);
-            let input = Paragraph::new(input_str.as_ref())
+            let mut input_block = Block::default()
+                .title(app.input_box.name)
+                .borders(Borders::ALL);
+            let input = Paragraph::new(app.input_box.input_str.as_ref())
                 .block(Block::default().borders(Borders::ALL).title("Input"));
 
             match selected_block {
@@ -601,15 +624,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                             TBlocks::Input => TBlocks::ChatList,
                         }
                     }
-                    Key::Esc => {}
-                    /*
-                    Key::Char(c) => {
-                        input_str.push(c);
-                    }
-                    Key::Backspace => {
-                        input_str.pop();
-                    }
-                    */
+                    Key::Char('i') => app.curr_mode = InputMode::Insert,
                     _ => match selected_block {
                         TBlocks::ChatList => {
                             app.chat_list
@@ -627,17 +642,34 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                         _ => {}
                     },
                 },
-                InputMode::_Insert => match input {
-                    Key::Esc => {
-                        app.curr_mode = InputMode::Normal;
+                InputMode::Insert => {
+                    let cur_chat_id = app
+                        .chat_list
+                        .chat_vec
+                        .lock()
+                        .unwrap()
+                        .get(app.chat_list.selected_index as usize)
+                        .unwrap()
+                        .chat
+                        .id();
+                    match input {
+                        Key::Esc => app.curr_mode = InputMode::Normal,
+                        _ => match selected_block {
+                            TBlocks::ChatList => app.chat_list.handle_input_insert(
+                                &app.outgoing_queue,
+                                &input,
+                                cur_chat_id,
+                            ),
+                            TBlocks::Input => app.input_box.handle_input_insert(
+                                &app.outgoing_queue,
+                                &input,
+                                cur_chat_id,
+                            ),
+
+                            _ => {}
+                        },
                     }
-                    _ => match selected_block {
-                        TBlocks::ChatList => app
-                            .chat_list
-                            .handle_input_insert(&app.outgoing_queue, &input),
-                        _ => {}
-                    },
-                },
+                }
             }
         }
     }
@@ -653,11 +685,7 @@ fn build_msg_list(
     chat_box_height: usize,
     chat_history: &mut Vec<ListItem>,
 ) -> (usize, usize) {
-    // Track total line height of displayed messages
-    let mut history_height = 0;
-
     // Track total number of messages displayed, for tracking scroll
-    let mut displayed_msgs = 0;
 
     let h = chat.history.lock().unwrap();
     let mut temp_vec = vec![Message::builder().build(); chat.bottom_index];
@@ -670,6 +698,7 @@ fn build_msg_list(
         }
     };
 
+    let mut history_height = 0;
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
     for msg in chat_slice {
         //TODO: handle more message types
@@ -678,75 +707,42 @@ fn build_msg_list(
             None => "[none]".to_string(),
         };
         let (sender_name, sender_color) = match ui_users.get(&msg.sender_user_id()) {
-            Some(u) => (&u.u.first_name()[..], u.color),
-            None => ("Unknown User", COLORS[0]),
+            Some(u) => (u.u.first_name().to_string(), u.color),
+            None => ("Unknown User".to_string(), COLORS[0]),
         };
-        let sender_name = sender_name.to_owned() + ": ";
+        //let sender_name = "dumbdumb";
+        //let sender_color = COLORS[0];
         let send_len = sender_name.chars().count();
-        let mut newline_index = chat_box_width;
-        let mut first_line = vec![Span::styled(
-            sender_name,
-            Style::default()
-                .remove_modifier(Modifier::BOLD)
-                .fg(sender_color),
-        )];
+
         let text_style = Style::default()
             .remove_modifier(Modifier::BOLD)
             .fg(Color::White);
-
-        let mut rest_of_message = Text::from("");
-        let mut last_index = 0;
-        while newline_index < send_len + msg_text.chars().count() {
-            let old_nl_index = newline_index;
-            //Break on word
-            while newline_index > send_len
-                && msg_text.chars().nth(newline_index - send_len).unwrap() != ' '
-            {
-                if msg_text.chars().nth(newline_index - send_len) == Some('\n') {
-                    break;
-                }
-                newline_index -= 1;
-            }
-            let mut replace_index = newline_index - send_len;
-            if newline_index == send_len {
-                replace_index = old_nl_index - send_len;
-            }
-            let msg_slice: String = msg_text
-                .chars()
-                .take(replace_index)
-                .skip(last_index)
-                .collect();
-            if last_index == 0 {
+        let full_msg = format!("{}: {}", sender_name, msg_text);
+        let lines = textwrap::fill(&full_msg, chat_box_width);
+        let mut lis = Text::from("");
+        for (i, l) in lines.lines().collect::<Vec<&str>>().iter().enumerate() {
+            history_height += 1;
+            if i == 0 {
+                let mut first_line = vec![Span::styled(
+                    sender_name.clone(),
+                    Style::default()
+                        .remove_modifier(Modifier::BOLD)
+                        .fg(sender_color),
+                )];
+                let msg_slice: String = (*l).chars().skip(send_len).collect();
                 first_line.push(Span::styled(msg_slice, text_style));
-            } else {
-                rest_of_message.extend(Text::styled(msg_slice, text_style));
+                lis = Text::from(Spans::from(first_line));
+                continue;
             }
-            last_index = replace_index + 1;
-            if newline_index == send_len {
-                last_index -= 1;
-            }
-            newline_index = last_index + chat_box_width;
+            let t = Text::styled((*l).to_owned(), text_style).to_owned();
+            lis.extend(t);
         }
-        let msg_slice: String = msg_text.chars().skip(last_index).collect();
-        if last_index == 0 {
-            first_line.push(Span::styled(msg_slice, text_style));
-        } else {
-            rest_of_message.extend(Text::styled(msg_slice, text_style));
-        }
-
-        let mut formatted_msg = Text::from(Spans::from(first_line));
-
-        formatted_msg.extend(rest_of_message);
-        let li = ListItem::new(formatted_msg);
-        if history_height + li.height() <= chat_box_height {
-            displayed_msgs += 1;
-        } else {
+        if history_height > chat_box_height {
             break;
         }
-        history_height += li.height();
-        chat_history.push(li);
+        chat_history.push(ListItem::new(lis));
     }
-    return (displayed_msgs, history_height);
+    return (chat_history.len(), history_height);
 }
 /*
  *   Get specified command line argument
@@ -759,4 +755,54 @@ fn get_arg(arg_name: &str) -> Option<String> {
         }
     }
     None
+}
+fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
+    // ANOTHER WEIRD STOPGAP
+    cur_msg["sender_user_id"] = cur_msg["sender"]["user_id"].to_owned();
+    cur_msg["views"] = json!(1);
+    let cur_msg = match Message::from_json(cur_msg.to_string()) {
+        Err(_e) => {
+            let msg_builder = &mut Message::builder();
+            let formatted_str = match cur_msg["content"]["@type"].as_str().unwrap() {
+                "messageSticker" => {
+                    format!("[{} Sticker]", cur_msg["content"]["sticker"]["emoji"])
+                }
+                //TODO: more type safety
+                "messageText" => match cur_msg["content"].get("web_page") {
+                    Some(_c) => {
+                        let wp = &cur_msg["content"]["web_page"];
+                        format!(
+                            "{}\n{}\n{}\n{}",
+                            cur_msg["content"]["text"]["text"].as_str().unwrap(),
+                            wp["site_name"].as_str().unwrap(),
+                            wp["title"].as_str().unwrap(),
+                            wp["description"]["text"].as_str().unwrap()
+                        )
+                    }
+
+                    None => "[none]".to_owned(),
+                },
+                t => {
+                    eprintln!("truly the type is {}", t);
+                    "[none]".to_owned()
+                }
+            };
+            msg_builder
+                .content(MessageContent::MessageText(
+                    MessageText::builder()
+                        .text(FormattedText::builder().text(formatted_str))
+                        .build(),
+                ))
+                .chat_id(chat_id)
+                .sender_user_id(
+                    cur_msg["sender_user_id"]
+                        .to_string()
+                        .parse::<i64>()
+                        .unwrap(),
+                )
+                .build()
+        }
+        Ok(ok) => ok,
+    };
+    return cur_msg;
 }
