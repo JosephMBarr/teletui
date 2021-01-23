@@ -21,9 +21,12 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
-
+// Seconds to wait for message form Tdlib
 const TIMEOUT: f64 = 0.5;
+
+// TUI box margin
 const MARGIN: u16 = 1;
+
 const DEBUG_LEVEL: i64 = 0;
 const DO_DEBUG: bool = false;
 const CODE_ARG: &str = "--code=";
@@ -54,49 +57,102 @@ enum InputMode {
     Normal,
     Insert,
 }
+
+// TUI Blocks
 enum TBlocks {
     ChatList,
     CurrChat,
     Input,
 }
+
+// The whole application
 #[derive(Clone)]
 struct App {
     curr_mode: InputMode,
+
+    // Queue of requests outgoing to Tdlib
     outgoing_queue: Arc<Mutex<VecDeque<String>>>,
     users: Arc<Mutex<HashMap<i64, TUser>>>,
+    basic_groups: Arc<Mutex<HashMap<i64, BasicGroup>>>,
     chat_list: Chats,
     input_box: InputBox,
 }
+impl App {
+    fn new() -> App {
+        App {
+            curr_mode: InputMode::Normal,
+            outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
+            users: Arc::new(Mutex::new(HashMap::new())),
+            basic_groups: Arc::new(Mutex::new(HashMap::new())),
+            chat_list: Chats::new("Chats"),
+            input_box: InputBox::new("Input"),
+        }
+    }
+}
+
+// The message input box
 #[derive(Clone)]
 struct InputBox {
     input_str: String,
+
+    // Box title
     name: &'static str,
 }
+
+// The box containing the list of chats
 #[derive(Clone)]
 struct Chats {
+    // Vector containing each chat
     chat_vec: Arc<Mutex<Vec<TChat>>>,
+
+    // Title associated with block
     name: &'static str,
+
+    // Index within chat_vec of currently selected chat
     selected_index: i32,
 }
+
+// A wrapper for Tdlib User with extra information
 #[derive(Clone)]
 struct TUser {
     u: User,
+
+    // Color of users name in chat; calculated to be as globally unique as possible
     color: Color,
 }
 
+// A wrapper for Tdlib Chat with extra information
 #[derive(Clone)]
 struct TChat {
+    // History of messages in this chat
     history: Arc<Mutex<Vec<Message>>>,
+
+    // The relevant chat
     chat: Chat,
+
+    // Whether chat has reached the end of history i.e. no messages left to retrieve
     end_of_history: bool,
+
+    // Starting message id of current request, if there is one
+    // Used to prevent redundant requests
     retrieving: i64,
-    viewport_height: usize,
+
+    // Number of messages currently displayed on screen
+    num_onscreen: usize,
+
+    // Index (within history) of the message at the bottom of the screen
     bottom_index: usize,
+
+    // Direction in which last scroll went. Used to determine rendering and assure continuity
+    // e.g. when user pages down, the new top message should be the previous bottom one
     last_scroll_direction: ScrollDirection,
 }
 impl App {}
 
 impl TChat {
+    // Retrieve history of messages in chat, starting at message with id `start_id`,
+    // retrieving up to `limit` messages, and placing the final request in `queue`, which
+    // is generally the app output queue
     fn retrieve_history(
         &mut self,
         queue: &Arc<Mutex<VecDeque<String>>>,
@@ -116,6 +172,8 @@ impl TChat {
             .push_back(chat_history_req.to_json().unwrap());
     }
 
+    // Returns the id of the oldest message in history. If there is no history yet, return 0.
+    // Passing 0 as the id to the message request tells Tdlib to get the newest messages
     fn get_oldest_id(&self) -> i64 {
         let hc = self.history.lock().unwrap();
         if hc.len() == 0 {
@@ -123,19 +181,24 @@ impl TChat {
         }
         hc[hc.len() - 1].id().to_string().parse::<i64>().unwrap()
     }
+
+    // Create a TChat from a JSON string of a Tdlib Chat
     fn from_json(j: String) -> TChat {
         TChat {
             chat: Chat::from_json(j).unwrap(),
             history: Arc::new(Mutex::new(Vec::new())),
             end_of_history: false,
             retrieving: -1,
-            viewport_height: 0,
+            num_onscreen: 0,
             bottom_index: 0,
+
+            // By default, start rendering from the bottom
             last_scroll_direction: ScrollDirection::Up,
         }
     }
 }
 
+// TUI block
 trait TBlock {
     fn new(name: &'static str) -> Self;
 
@@ -153,6 +216,8 @@ trait TBlock {
         _cur_chat_id: i64,
     ) {
     }
+
+    // Handle input in normal mode. Generally use classic Vi(m) keybinds
     fn handle_input_normal(
         &mut self,
         _queue: &Arc<Mutex<VecDeque<String>>>,
@@ -167,7 +232,10 @@ trait TBlock {
         }
     }
 }
+
+// List of chats
 impl Chats {
+    // Returns chat having given ID, if it exists
     fn get_chat_by_id(&mut self, chat_id: i64) -> Option<TChat> {
         for chat in self.chat_vec.clone().lock().unwrap().iter() {
             if chat.chat.id() == chat_id {
@@ -178,7 +246,10 @@ impl Chats {
     }
 }
 
+// Message input box
 impl InputBox {
+    // Creates message to be sent to chat, using passed in chat ID and the contents of
+    // the input string
     fn send_message(&mut self, cur_chat_id: i64, queue: &Arc<Mutex<VecDeque<String>>>) {
         let msg = InputMessageContent::InputMessageText(
             InputMessageText::builder()
@@ -194,6 +265,7 @@ impl InputBox {
         self.input_str.clear();
     }
 }
+
 impl TBlock for InputBox {
     fn new(name: &'static str) -> InputBox {
         InputBox {
@@ -211,6 +283,8 @@ impl TBlock for InputBox {
             Key::Char('\n') => {
                 self.send_message(cur_chat_id, queue);
             }
+
+            // Add unremarkable character to input string
             Key::Char(input) => {
                 self.input_str.push(*input);
             }
@@ -230,6 +304,8 @@ impl TBlock for Chats {
             selected_index: 0,
         }
     }
+
+    // Get number of chats
     fn get_len(&self) -> Result<i32, io::Error> {
         let cur_size: usize = self.chat_vec.lock().unwrap().len();
         if cur_size > u32::MAX as usize {
@@ -239,18 +315,25 @@ impl TBlock for Chats {
             Ok(cur_size as i32)
         }
     }
+
+    // Go up by one chat
     fn scroll_up(&mut self) {
         self.selected_index = (self.selected_index - 1) % self.get_len().unwrap();
+
+        // Wrap around to bottom of list
         if self.selected_index < 0 {
             self.selected_index = self.get_len().unwrap() - 1;
         }
     }
+
     fn scroll_down(&mut self) {
+        // Wrap around to top of list
         self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
     }
     fn page_down(&mut self) {}
     fn page_up(&mut self) {}
 }
+
 impl TBlock for TChat {
     fn new(_name: &'static str) -> TChat {
         TChat {
@@ -258,26 +341,34 @@ impl TBlock for TChat {
             history: Arc::new(Mutex::new(Vec::new())),
             end_of_history: false,
             retrieving: -1,
-            viewport_height: 0,
+            num_onscreen: 0,
             bottom_index: 0,
+            // By default, start rendering from bottom
             last_scroll_direction: ScrollDirection::Up,
         }
     }
+
+    // Scroll up such that the topmost message becomes the bottom one
     fn page_up(&mut self) {
         self.last_scroll_direction = ScrollDirection::Up;
-        self.bottom_index += self.viewport_height;
+        self.bottom_index += self.num_onscreen;
     }
     //TODO: fiddle with scrolling off-by-one
     fn page_down(&mut self) {
         self.last_scroll_direction = ScrollDirection::Down;
-        if (self.bottom_index as i64 - self.viewport_height as i64) <= self.viewport_height as i64 {
+
+        // If the bottom message is also the newest one, make sure it's flush
+        // with the bottom of the box, as to avoid blank gaps at bottom
+        if (self.bottom_index as i64 - self.num_onscreen as i64) <= self.num_onscreen as i64 {
             self.last_scroll_direction = ScrollDirection::Up;
         }
-        if (self.bottom_index as i64 - self.viewport_height as i64) <= 0 {
+        if (self.bottom_index as i64 - self.num_onscreen as i64) <= 0 {
             self.bottom_index = 0;
             return;
         }
-        self.bottom_index -= self.viewport_height;
+
+        // Reduce bottom index by page height
+        self.bottom_index -= self.num_onscreen;
     }
     fn scroll_up(&mut self) {
         self.last_scroll_direction = ScrollDirection::Up;
@@ -285,7 +376,10 @@ impl TBlock for TChat {
     }
     fn scroll_down(&mut self) {
         self.last_scroll_direction = ScrollDirection::Down;
-        if (self.bottom_index as i64 - self.viewport_height as i64) <= self.viewport_height as i64 {
+
+        // Use same safeguard as paging down to ensure bottom message is always flush with
+        // bottom of box
+        if (self.bottom_index as i64 - self.num_onscreen as i64) <= self.num_onscreen as i64 {
             self.last_scroll_direction = ScrollDirection::Up;
         }
         if self.bottom_index as i64 <= 0 {
@@ -297,31 +391,33 @@ impl TBlock for TChat {
 }
 
 fn main() {
+    // Telegram API access object
     let tdlib = Tdlib::new();
+
+    // Set verbosity level to handle volume of debug output
     let set_verbosity_level = SetLogVerbosityLevel::builder()
         .new_verbosity_level(DEBUG_LEVEL)
         .build();
     tdlib.send(&set_verbosity_level.to_json().unwrap());
 
-    //Main listening loop
+    // Start parallel threads, one for UI, the other for managing requests with Tdlib
     thread::scope(|s| {
-        let mut app = App {
-            curr_mode: InputMode::Normal,
-            outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
-            users: Arc::new(Mutex::new(HashMap::new())),
-            chat_list: Chats::new("Chats"),
-            input_box: InputBox::new("Input"),
-        };
+        let mut app = App::new();
+
+        // Create an Arc reference to pass into request (receiving) thread
         let mut rec_app = app.clone();
         let _rec_thread = s.spawn(move |_| {
+            // Spawn thread for managing requests
             td_thread(&tdlib, &mut rec_app);
         });
 
+        // Spawn UI thread
         ui_thread(&mut app).unwrap();
     })
     .unwrap();
 }
 
+// Read in API information and user phone number from file
 fn read_info() -> io::Result<(i64, String, String)> {
     let file = File::open("info.txt")?;
     let mut reader = BufReader::new(file);
@@ -334,6 +430,7 @@ fn read_info() -> io::Result<(i64, String, String)> {
     reader.read_line(&mut api_hash)?;
     reader.read_line(&mut phone_number)?;
 
+    // Remove whitespace and parse ID as int, as required by requests
     let api_id: i64 = api_id.trim().parse().unwrap();
 
     Ok((
@@ -343,7 +440,8 @@ fn read_info() -> io::Result<(i64, String, String)> {
     ))
 }
 
-fn setup_interface(tdlib: &Tdlib) {
+// Get list of user's chats
+fn get_chat_list(tdlib: &Tdlib) {
     let chat_list = ChatList::default();
     let chat_list_req = GetChats::builder()
         .chat_list(chat_list)
@@ -354,10 +452,12 @@ fn setup_interface(tdlib: &Tdlib) {
     tdlib.send(&chat_list_req.to_json().unwrap());
 }
 
+// Initialization parameters for Tdlib
 fn send_tdlib_parameters(tdlib: &Tdlib, api_id: i64, api_hash: &str) {
     let set_tdlib_parameters = SetTdlibParameters::builder()
         .parameters(
             TdlibParameters::builder()
+                // Don't use test data, communicate with actual Telegram
                 .use_test_dc(false)
                 .database_directory("/tmp/td")
                 .files_directory("/tmp/td")
@@ -374,11 +474,14 @@ fn send_tdlib_parameters(tdlib: &Tdlib, api_id: i64, api_hash: &str) {
     tdlib.send(&set_tdlib_parameters.to_json().unwrap());
 }
 
+// Check database encryption key with Telegram
+// TODO: use actual key
 fn send_check_encryption_key(tdlib: &Tdlib) {
     let check_enc_key = CheckDatabaseEncryptionKey::builder().build();
     tdlib.send(&check_enc_key.to_json().unwrap());
 }
 
+// Send phone number to Tdlib to connect app with account
 fn send_phone_parameters(tdlib: &Tdlib, phone_number: &str) {
     let phone_parameters = SetAuthenticationPhoneNumber::builder()
         .phone_number(phone_number)
@@ -388,6 +491,7 @@ fn send_phone_parameters(tdlib: &Tdlib, phone_number: &str) {
     tdlib.send(&phone_parameters.to_json().unwrap());
 }
 
+// Send agreement to terms of service
 fn _send_registration(tdlib: &Tdlib, first_name: &str, last_name: &str) {
     let reg = RegisterUser::builder()
         .first_name(first_name)
@@ -397,86 +501,131 @@ fn _send_registration(tdlib: &Tdlib, first_name: &str, last_name: &str) {
     tdlib.send(&reg.to_json().unwrap());
 }
 
+// Driver for Tdlib communication
 fn td_thread(tdlib: &Tdlib, app: &mut App) {
     let (api_id, api_hash, phone_number) = read_info().unwrap();
     loop {
+        // Wait for message for `TIMEOUT` seconds
         match tdlib.receive(TIMEOUT) {
             Some(res) => {
+                // Decode request string into an object
                 let mut obj: Value = serde_json::from_str(&res).unwrap();
                 if DO_DEBUG {
                     eprintln!("Received: {:?}", obj.get("@type"));
                 }
                 match obj["@type"].as_str().unwrap() {
+                    // Received any of a number of auth state changes
                     "updateAuthorizationState" => {
                         let astate = &obj["authorization_state"];
                         match astate["@type"].as_str().unwrap() {
+                            // Authorization complete, get list of chats
                             "authorizationStateReady" => {
                                 //TODO: store auth credentials
-                                setup_interface(&tdlib);
+                                get_chat_list(&tdlib);
                             }
+                            // Initial setup request
                             "authorizationStateWaitTdlibParameters" => {
                                 send_tdlib_parameters(&tdlib, api_id, &api_hash);
                             }
+
+                            // Send Tdlib database encryption key
                             "authorizationStateWaitEncryptionKey" => {
                                 send_check_encryption_key(&tdlib)
                             }
+
+                            // Tdlib is waiting for phone number
                             "authorizationStateWaitPhoneNumber" => {
                                 send_phone_parameters(&tdlib, &phone_number);
                             }
+
+                            // Tdlib is awaiting authorization code that was sent
+                            // to user via Telegram, SMS, or otherwise
                             "authorizationStateWaitCode" => {
+                                // Get code argument from command line args
                                 let input_code = match get_arg(CODE_ARG) {
                                     Some(c) => c,
                                     None => {
+                                        // Code was needed but not provided,
+                                        // so exit and tell user to run again, providing code
                                         eprintln!("{}", NO_CODE_PROVIDED);
                                         std::process::exit(0);
                                     }
                                 };
+
+                                // Check provided auth code against Tdlib's expectation
                                 let check_auth_code = CheckAuthenticationCode::builder()
                                     .code(input_code.trim())
                                     .build();
 
                                 tdlib.send(&check_auth_code.to_json().unwrap());
                             }
+                            // TODO: handle all auth cases
                             _ => {
                                 eprintln!("unhandled auth case!: {}", astate);
                             }
                         }
-                    } // end updateAuthorizationState
+                    }
+
+                    // Received user information. Can be new or an update to an existing
                     "updateUser" => {
                         let num_users = app.users.lock().unwrap().len();
+                        // Create TUser, parsing JSON as a User and determining name color
                         let new_user = TUser {
+                            // Calculate the next color to use, maintaining maximum variety
                             color: COLORS[num_users % COLORS.len()],
                             u: User::from_json(obj["user"].to_string()).unwrap(),
                         };
+                        // Place user in hash map (or update, if already exists)
                         app.users.lock().unwrap().insert(new_user.u.id(), new_user);
                     }
 
+                    // Received information about a basic group
+                    "updateBasicGroup" => {
+                        // Parse JSON as Basic Group and insert (or update) to HashMap
+                        let new_group =
+                            BasicGroup::from_json(obj["basic_group"].to_string()).unwrap();
+                        app.basic_groups
+                            .lock()
+                            .unwrap()
+                            .insert(new_group.id(), new_group);
+                    }
+
+                    // Received information about a chat of which we've not heard before
                     "updateNewChat" => {
                         let new_chat = &mut obj["chat"];
 
-                        // BEGIN WEIRD STOPGAP I SHOULD PROBABLY RESOLVE
+                        // Add attributes to new_chat that are expected by rtdlib,
+                        // but not provided by the API
                         new_chat["order"] = serde_json::from_str("1").unwrap();
                         new_chat["is_pinned"] = serde_json::from_value(json!(false)).unwrap();
                         new_chat["is_sponsored"] = serde_json::from_value(json!(false)).unwrap();
                         new_chat["pinned_message_id"] = serde_json::from_value(json!(0)).unwrap();
-                        //END WEIRD STOPGAP
 
+                        // Add TChat to chat list
                         let tchat = TChat::from_json(new_chat.to_string());
                         app.chat_list.chat_vec.lock().unwrap().push(tchat);
                     }
+
+                    // Received information about a message of which we've not heard before
                     "updateNewMessage" => {
-                        eprintln!("new message {}", obj);
                         let msg = &mut obj["message"];
                         let chat_id = match msg["chat_id"].as_i64() {
                             Some(ok) => ok,
                             None => panic!("Couldn't get id: {}", msg),
                         };
+
+                        // Determine the chat to which message belongs
                         let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
                         let mut cur_chat_history = cur_chat.history.lock().unwrap();
+
+                        // Parse message into rtdlib::Message type
                         let cur_msg = parse_msg(msg, chat_id);
-                        //place at start
+                        // Place at start, rather than push to end
+                        // TODO: maintain order
                         cur_chat_history.insert(0, cur_msg);
                     }
+
+                    // Received a list of messages, initiated by GetChatHistory call
                     "messages" => {
                         let msg_count = obj["total_count"].as_u64().unwrap();
                         let msg_list = &mut obj["messages"];
@@ -485,12 +634,15 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                             None => panic!("Couldn't get id: {}", msg_list),
                         };
                         let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
+
+                        // If received at least one message, insert into history
                         if msg_count > 0 {
                             let mut cur_chat_history = cur_chat.history.lock().unwrap();
                             for cur_msg in msg_list.as_array_mut().unwrap() {
                                 let cur_msg = parse_msg(cur_msg, chat_id);
                                 cur_chat_history.push(cur_msg);
                             }
+                        // If no messages received, have evidently reached end of chat history
                         } else {
                             cur_chat.end_of_history = true;
                         }
@@ -498,9 +650,10 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                     _ => {}
                 }
             }
+            // When nothing received after timeout, go ahead and send any queued requests
             None => {
-                //Didn't receive, free to send
                 let sz = app.outgoing_queue.lock().unwrap().len();
+                // Send each request in queue, in order
                 for _ in 0..sz {
                     let s = app.outgoing_queue.lock().unwrap().pop_front().unwrap();
                     tdlib.send(&s);
@@ -544,6 +697,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                 .split(chunks[0]);
             let mut chat_titles = vec::Vec::new();
             let ui_users = app.users.lock().unwrap();
+            let ui_basic_groups = app.basic_groups.lock().unwrap();
             chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top() - 2 * MARGIN).into();
             chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2 * MARGIN).into();
             let mut chat_history = vec::Vec::new();
@@ -568,7 +722,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     &mut chat_history,
                 );
                 chat_titles.push(chat_list_item.style(selected_style));
-                chat.viewport_height = displayed_msgs;
+                chat.num_onscreen = displayed_msgs;
                 //TODO: fix end of history
                 let oldest_id = chat.get_oldest_id();
                 if history_height < chat_box_height.into()
@@ -590,16 +744,20 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     if status.is_online() {
                         "online".to_string()
                     } else if status.is_offline() {
-                        let date_time = NaiveDateTime::from_timestamp(
-                            status.as_offline().unwrap().was_online(),
-                            0,
-                        );
-                        format!("last seen {}", date_time)
+                        let ts: u64 = status.as_offline().unwrap().was_online() as u64;
+                        let d = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts);
+                        let date_time = DateTime::<Local>::from(d);
+                        format!("last seen {}", date_time.format("%H:%M on %m/%d"))
                     } else {
                         "unknown".to_string()
                     }
+                } else if chat.chat.type_().is_basic_group() {
+                    let group_id = chat.chat.type_().as_basic_group().unwrap().basic_group_id();
+                    let group = ui_basic_groups.get(&group_id).unwrap();
+                    //TODO get online count
+                    format!("{} members", group.member_count())
                 } else {
-                    "some group".to_string()
+                    "unknown".to_string()
                 };
                 chat_title = format!("{}: {}", *chat.chat.title(), extra_info);
             }
@@ -616,8 +774,11 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
             let mut input_block = Block::default()
                 .title(app.input_box.name)
                 .borders(Borders::ALL);
-            let input = Paragraph::new(app.input_box.input_str.as_ref())
-                .block(Block::default().borders(Borders::ALL).title("Input"));
+            let input = Paragraph::new(app.input_box.input_str.as_ref()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(app.input_box.name),
+            );
 
             match selected_block {
                 TBlocks::ChatList => chats_block = chats_block.style(selected_style),
@@ -722,6 +883,9 @@ fn build_msg_list(
     };
 
     let mut history_height = 0;
+    let text_style = Style::default()
+        .remove_modifier(Modifier::BOLD)
+        .fg(Color::White);
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
     for msg in chat_slice {
         //TODO: handle more message types
@@ -733,17 +897,12 @@ fn build_msg_list(
             Some(u) => (u.u.first_name().to_string(), u.color),
             None => ("Unknown User".to_string(), COLORS[0]),
         };
-        //let sender_name = "dumbdumb";
-        //let sender_color = COLORS[0];
         let send_len = sender_name.chars().count();
 
-        let text_style = Style::default()
-            .remove_modifier(Modifier::BOLD)
-            .fg(Color::White);
         let full_msg = format!("{}: {}", sender_name, msg_text);
         let lines = textwrap::fill(&full_msg, chat_box_width);
         let mut lis = Text::from("");
-        for (i, l) in lines.lines().collect::<Vec<&str>>().iter().enumerate() {
+        for (i, l) in lines.lines().enumerate() {
             history_height += 1;
             if i == 0 {
                 let mut first_line = vec![Span::styled(
