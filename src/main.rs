@@ -1,4 +1,3 @@
-// TODO: figure out how to scroll down properly
 extern crate chrono;
 use chrono::prelude::*;
 mod event;
@@ -10,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::vec;
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
@@ -47,6 +46,10 @@ const COLORS: [Color; 13] = [
     Color::LightCyan,
 ];
 
+enum MsgCode {
+    Exit,
+}
+
 #[derive(Clone)]
 enum ScrollDirection {
     Up,
@@ -73,7 +76,7 @@ struct App {
     // Queue of requests outgoing to Tdlib
     outgoing_queue: Arc<Mutex<VecDeque<String>>>,
     users: Arc<Mutex<HashMap<i64, TUser>>>,
-    basic_groups: Arc<Mutex<HashMap<i64, BasicGroup>>>,
+    basic_groups: Arc<Mutex<HashMap<i64, TBasicGroup>>>,
     chat_list: Chats,
     input_box: InputBox,
 }
@@ -88,6 +91,12 @@ impl App {
             input_box: InputBox::new("Input"),
         }
     }
+}
+
+// A wrapper for Tdlib's Basic Group
+struct TBasicGroup {
+    g: BasicGroup,
+    full_info: BasicGroupFullInfo,
 }
 
 // The message input box
@@ -119,6 +128,8 @@ struct TUser {
 
     // Color of users name in chat; calculated to be as globally unique as possible
     color: Color,
+    full_info: UserFullInfo,
+    status: UserStatus,
 }
 
 // A wrapper for Tdlib Chat with extra information
@@ -261,7 +272,6 @@ impl InputBox {
             .input_message_content(msg)
             .build();
         queue.lock().unwrap().push_back(req.to_json().unwrap());
-        //TODO: Error checking
         self.input_str.clear();
     }
 }
@@ -400,6 +410,10 @@ fn main() {
         .build();
     tdlib.send(&set_verbosity_level.to_json().unwrap());
 
+    // Set up cross-thread communication
+    let (tx_ui, rx_td) = mpsc::channel::<MsgCode>();
+    let (tx_td, rx_ui) = mpsc::channel::<MsgCode>();
+
     // Start parallel threads, one for UI, the other for managing requests with Tdlib
     thread::scope(|s| {
         let mut app = App::new();
@@ -408,11 +422,11 @@ fn main() {
         let mut rec_app = app.clone();
         let _rec_thread = s.spawn(move |_| {
             // Spawn thread for managing requests
-            td_thread(&tdlib, &mut rec_app);
+            td_thread(&tdlib, &mut rec_app, tx_td, rx_td);
         });
 
         // Spawn UI thread
-        ui_thread(&mut app).unwrap();
+        ui_thread(&mut app, tx_ui, rx_ui).unwrap();
     })
     .unwrap();
 }
@@ -502,9 +516,18 @@ fn _send_registration(tdlib: &Tdlib, first_name: &str, last_name: &str) {
 }
 
 // Driver for Tdlib communication
-fn td_thread(tdlib: &Tdlib, app: &mut App) {
+fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::Receiver<MsgCode>) {
     let (api_id, api_hash, phone_number) = read_info().unwrap();
     loop {
+        // Check for cross-thread messages
+        match rx.try_recv() {
+            Ok(c) => match c {
+                MsgCode::Exit => {
+                    return;
+                }
+            },
+            Err(_) => {}
+        }
         // Wait for message for `TIMEOUT` seconds
         match tdlib.receive(TIMEOUT) {
             Some(res) => {
@@ -513,7 +536,9 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                 if DO_DEBUG {
                     eprintln!("Received: {:?}", obj.get("@type"));
                 }
-                match obj["@type"].as_str().unwrap() {
+                //TODO: less string wizardry
+                match &detect_td_type(&res).unwrap()[..] {
+                    //match obj["@type"].as_str().unwrap() {
                     // Received any of a number of auth state changes
                     "updateAuthorizationState" => {
                         let astate = &obj["authorization_state"];
@@ -548,7 +573,8 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                         // Code was needed but not provided,
                                         // so exit and tell user to run again, providing code
                                         eprintln!("{}", NO_CODE_PROVIDED);
-                                        std::process::exit(0);
+                                        tx.send(MsgCode::Exit).unwrap();
+                                        return;
                                     }
                                 };
 
@@ -559,7 +585,6 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
 
                                 tdlib.send(&check_auth_code.to_json().unwrap());
                             }
-                            // TODO: handle all auth cases
                             _ => {
                                 eprintln!("unhandled auth case!: {}", astate);
                             }
@@ -569,25 +594,59 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                     // Received user information. Can be new or an update to an existing
                     "updateUser" => {
                         let num_users = app.users.lock().unwrap().len();
-                        // Create TUser, parsing JSON as a User and determining name color
-                        let new_user = TUser {
-                            // Calculate the next color to use, maintaining maximum variety
-                            color: COLORS[num_users % COLORS.len()],
-                            u: User::from_json(obj["user"].to_string()).unwrap(),
-                        };
-                        // Place user in hash map (or update, if already exists)
-                        app.users.lock().unwrap().insert(new_user.u.id(), new_user);
+                        let uid = obj["user"]["id"].as_i64().unwrap();
+                        // Create TUser, parsing JSON as a User and determining name color,
+                        // or update if already exists
+                        app.users
+                            .lock()
+                            .unwrap()
+                            .entry(uid)
+                            .and_modify(|tu| {
+                                tu.u = User::from_json(obj["user"].to_string()).unwrap()
+                            })
+                            .or_insert(TUser {
+                                u: User::from_json(obj["user"].to_string()).unwrap(),
+                                // Calculate the next color to use, maintaining maximum variety
+                                color: COLORS[num_users % COLORS.len()],
+                                full_info: UserFullInfo::builder().build(),
+                                status: UserStatus::from_json(obj["user"]["status"].to_string())
+                                    .unwrap(),
+                            });
+                    }
+
+                    // Received an update to users status (online/offline/etc.)
+                    "updateUserStatus" => {
+                        let uid = obj["user_id"].as_i64().unwrap();
+                        app.users.lock().unwrap().entry(uid).and_modify(|tu| {
+                            tu.status = UserStatus::from_json(obj["status"].to_string()).unwrap();
+                        });
                     }
 
                     // Received information about a basic group
                     "updateBasicGroup" => {
                         // Parse JSON as Basic Group and insert (or update) to HashMap
-                        let new_group =
-                            BasicGroup::from_json(obj["basic_group"].to_string()).unwrap();
+                        let new_group = TBasicGroup {
+                            g: BasicGroup::from_json(obj["basic_group"].to_string()).unwrap(),
+                            full_info: BasicGroupFullInfo::default(),
+                        };
                         app.basic_groups
                             .lock()
                             .unwrap()
-                            .insert(new_group.id(), new_group);
+                            .insert(new_group.g.id(), new_group);
+                    }
+                    // Received full information about a basic group
+                    "updateBasicGroupFullInfo" => {
+                        // Parse JSON as Basic Group and insert (or update) to HashMap
+                        app.basic_groups
+                            .lock()
+                            .unwrap()
+                            .entry(obj["basic_group_id"].as_i64().unwrap())
+                            .and_modify(|bgf| {
+                                bgf.full_info = BasicGroupFullInfo::from_json(
+                                    obj["basic_group_full_info"].to_string(),
+                                )
+                                .unwrap()
+                            });
                     }
 
                     // Received information about a chat of which we've not heard before
@@ -621,8 +680,8 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                         // Parse message into rtdlib::Message type
                         let cur_msg = parse_msg(msg, chat_id);
                         // Place at start, rather than push to end
-                        // TODO: maintain order
                         cur_chat_history.insert(0, cur_msg);
+                        cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
                     }
 
                     // Received a list of messages, initiated by GetChatHistory call
@@ -642,12 +701,31 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
                                 let cur_msg = parse_msg(cur_msg, chat_id);
                                 cur_chat_history.push(cur_msg);
                             }
+                            cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
                         // If no messages received, have evidently reached end of chat history
                         } else {
                             cur_chat.end_of_history = true;
                         }
                     }
-                    _ => {}
+                    "error" => {
+                        let msg = obj["message"].as_str().unwrap();
+                        let mut is_fatal = false;
+                        let error_msg = match msg {
+                            "PHONE_CODE_INVALID" => {
+                                is_fatal = true;
+                                "Incorrect code. Please try again."
+                            }
+                            _ => msg,
+                        };
+                        eprintln!("{}", error_msg);
+                        if is_fatal {
+                            tx.send(MsgCode::Exit).unwrap();
+                            return;
+                        }
+                    }
+                    _ => {
+                        eprintln!("Unhandled message: {}", obj);
+                    }
                 }
             }
             // When nothing received after timeout, go ahead and send any queued requests
@@ -663,11 +741,17 @@ fn td_thread(tdlib: &Tdlib, app: &mut App) {
     }
 }
 
-fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
+fn ui_thread(
+    app: &mut App,
+    tx: mpsc::Sender<MsgCode>,
+    rx: mpsc::Receiver<MsgCode>,
+) -> Result<(), std::io::Error> {
     let selected_style: Style = Style::default()
         .fg(Color::Blue)
         .add_modifier(Modifier::BOLD);
-    let unselected_style: Style = Style::default().fg(Color::White);
+    let unselected_style: Style = Style::default()
+        .fg(Color::White)
+        .remove_modifier(Modifier::BOLD);
     let stdout = io::stdout().into_raw_mode()?;
     let stdout = MouseTerminal::from(stdout);
     let stdout = AlternateScreen::from(stdout);
@@ -682,6 +766,15 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
     let mut chat_box_width: usize = 0;
     let mut start_corner = Corner::BottomLeft;
     loop {
+        match rx.try_recv() {
+            Ok(c) => match c {
+                MsgCode::Exit => {
+                    return Ok(());
+                }
+            },
+            Err(_) => {}
+        }
+
         terminal.draw(|f| {
             let size = f.size();
 
@@ -740,7 +833,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                     // Get user and the time they were last seen
                     let recipient_id = chat.chat.type_().as_private().unwrap().user_id();
                     let recipient = ui_users.get(&recipient_id).unwrap();
-                    let status = recipient.u.status();
+                    let status = &recipient.status;
                     if status.is_online() {
                         "online".to_string()
                     } else if status.is_offline() {
@@ -754,8 +847,22 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
                 } else if chat.chat.type_().is_basic_group() {
                     let group_id = chat.chat.type_().as_basic_group().unwrap().basic_group_id();
                     let group = ui_basic_groups.get(&group_id).unwrap();
-                    //TODO get online count
-                    format!("{} members", group.member_count())
+
+                    // Count up how many members in chat are online
+                    let members_online = group
+                        .full_info
+                        .members()
+                        .into_iter()
+                        .filter(|m| {
+                            let u = ui_users.get(&m.user_id()).unwrap();
+                            u.status.is_online() && u.u.type_().is_regular()
+                        })
+                        .count();
+                    format!(
+                        "{} members, {} online",
+                        group.g.member_count(),
+                        members_online
+                    )
                 } else {
                     "unknown".to_string()
                 };
@@ -774,11 +881,16 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
             let mut input_block = Block::default()
                 .title(app.input_box.name)
                 .borders(Borders::ALL);
-            let input = Paragraph::new(app.input_box.input_str.as_ref()).block(
+            let input = Paragraph::new(Text::styled(
+                app.input_box.input_str.to_string(),
+                unselected_style,
+            ))
+            .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(app.input_box.name),
-            );
+            )
+            .wrap(tui::widgets::Wrap { trim: true });
 
             match selected_block {
                 TBlocks::ChatList => chats_block = chats_block.style(selected_style),
@@ -799,6 +911,7 @@ fn ui_thread(app: &mut App) -> Result<(), std::io::Error> {
             match app.curr_mode {
                 InputMode::Normal => match input {
                     Key::F(1) => {
+                        tx.send(MsgCode::Exit).unwrap();
                         return Ok(());
                     }
                     Key::Char('\t') => {
@@ -888,7 +1001,6 @@ fn build_msg_list(
         .fg(Color::White);
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
     for msg in chat_slice {
-        //TODO: handle more message types
         let msg_text = match msg.content().as_message_text() {
             Some(s) => s.text().text().to_string(),
             None => "[none]".to_string(),
@@ -949,7 +1061,6 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
                 "messageSticker" => {
                     format!("[{} Sticker]", cur_msg["content"]["sticker"]["emoji"])
                 }
-                //TODO: more type safety
                 "messageText" => match cur_msg["content"].get("web_page") {
                     Some(_c) => {
                         let wp = &cur_msg["content"]["web_page"];
@@ -987,4 +1098,8 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
         Ok(ok) => ok,
     };
     return cur_msg;
+}
+
+fn msg_sort_helper(a: &Message, b: &Message) -> std::cmp::Ordering {
+    b.date().cmp(&a.date())
 }
