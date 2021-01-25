@@ -170,6 +170,11 @@ impl TChat {
         start_id: i64,
         limit: i64,
     ) {
+        if self.retrieving == start_id {
+            return;
+        }
+        eprintln!("retrieving from {}", start_id);
+        self.retrieving = start_id;
         let chat_history_req = GetChatHistory::builder()
             .chat_id(self.chat.id())
             .from_message_id(start_id)
@@ -280,7 +285,7 @@ impl TBlock for InputBox {
     fn new(name: &'static str) -> InputBox {
         InputBox {
             input_str: String::new(),
-            name: name,
+            name,
         }
     }
     fn handle_input_insert(
@@ -310,7 +315,7 @@ impl TBlock for Chats {
     fn new(name: &'static str) -> Chats {
         Chats {
             chat_vec: Arc::new(Mutex::new(Vec::new())),
-            name: name,
+            name,
             selected_index: 0,
         }
     }
@@ -518,224 +523,218 @@ fn _send_registration(tdlib: &Tdlib, first_name: &str, last_name: &str) {
 // Driver for Tdlib communication
 fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::Receiver<MsgCode>) {
     let (api_id, api_hash, phone_number) = read_info().unwrap();
+    // Wait for message for `TIMEOUT` seconds
     loop {
         // Check for cross-thread messages
-        match rx.try_recv() {
-            Ok(c) => match c {
+        if let Ok(c) = rx.try_recv() {
+            match c {
                 MsgCode::Exit => {
                     return;
                 }
-            },
-            Err(_) => {}
+            }
         }
-        // Wait for message for `TIMEOUT` seconds
-        match tdlib.receive(TIMEOUT) {
-            Some(res) => {
-                // Decode request string into an object
-                let mut obj: Value = serde_json::from_str(&res).unwrap();
-                if DO_DEBUG {
-                    eprintln!("Received: {:?}", obj.get("@type"));
-                }
-                //TODO: less string wizardry
-                match &detect_td_type(&res).unwrap()[..] {
-                    //match obj["@type"].as_str().unwrap() {
-                    // Received any of a number of auth state changes
-                    "updateAuthorizationState" => {
-                        let astate = &obj["authorization_state"];
-                        match astate["@type"].as_str().unwrap() {
-                            // Authorization complete, get list of chats
-                            "authorizationStateReady" => {
-                                //TODO: store auth credentials
-                                get_chat_list(&tdlib);
-                            }
-                            // Initial setup request
-                            "authorizationStateWaitTdlibParameters" => {
-                                send_tdlib_parameters(&tdlib, api_id, &api_hash);
-                            }
-
-                            // Send Tdlib database encryption key
-                            "authorizationStateWaitEncryptionKey" => {
-                                send_check_encryption_key(&tdlib)
-                            }
-
-                            // Tdlib is waiting for phone number
-                            "authorizationStateWaitPhoneNumber" => {
-                                send_phone_parameters(&tdlib, &phone_number);
-                            }
-
-                            // Tdlib is awaiting authorization code that was sent
-                            // to user via Telegram, SMS, or otherwise
-                            "authorizationStateWaitCode" => {
-                                // Get code argument from command line args
-                                let input_code = match get_arg(CODE_ARG) {
-                                    Some(c) => c,
-                                    None => {
-                                        // Code was needed but not provided,
-                                        // so exit and tell user to run again, providing code
-                                        eprintln!("{}", NO_CODE_PROVIDED);
-                                        tx.send(MsgCode::Exit).unwrap();
-                                        return;
-                                    }
-                                };
-
-                                // Check provided auth code against Tdlib's expectation
-                                let check_auth_code = CheckAuthenticationCode::builder()
-                                    .code(input_code.trim())
-                                    .build();
-
-                                tdlib.send(&check_auth_code.to_json().unwrap());
-                            }
-                            _ => {
-                                eprintln!("unhandled auth case!: {}", astate);
-                            }
-                        }
+        let sz = app.outgoing_queue.lock().unwrap().len();
+        // Send each request in queue, in order
+        for _ in 0..sz {
+            let s = app.outgoing_queue.lock().unwrap().pop_front().unwrap();
+            tdlib.send(&s);
+        }
+        let res = match tdlib.receive(TIMEOUT) {
+            Some(r) => r,
+            None => continue,
+        };
+        // Decode request string into an object
+        let mut obj: Value = serde_json::from_str(&res).unwrap();
+        if DO_DEBUG {
+            eprintln!("Received: {:?}", obj.get("@type"));
+        }
+        //TODO: less string wizardry
+        match &detect_td_type(&res).unwrap()[..] {
+            // Received any of a number of auth state changes
+            "updateAuthorizationState" => {
+                let astate =
+                    AuthorizationState::from_json(obj["authorization_state"].to_string()).unwrap();
+                match astate {
+                    // Authorization complete, get list of chats
+                    AuthorizationState::Ready(_) => {
+                        //AuthorizationState::Ready => {
+                        //TODO: store auth credentials
+                        get_chat_list(&tdlib);
+                    }
+                    // Initial setup request
+                    AuthorizationState::WaitTdlibParameters(_) => {
+                        send_tdlib_parameters(&tdlib, api_id, &api_hash);
                     }
 
-                    // Received user information. Can be new or an update to an existing
-                    "updateUser" => {
-                        let num_users = app.users.lock().unwrap().len();
-                        let uid = obj["user"]["id"].as_i64().unwrap();
-                        // Create TUser, parsing JSON as a User and determining name color,
-                        // or update if already exists
-                        app.users
-                            .lock()
-                            .unwrap()
-                            .entry(uid)
-                            .and_modify(|tu| {
-                                tu.u = User::from_json(obj["user"].to_string()).unwrap()
-                            })
-                            .or_insert(TUser {
-                                u: User::from_json(obj["user"].to_string()).unwrap(),
-                                // Calculate the next color to use, maintaining maximum variety
-                                color: COLORS[num_users % COLORS.len()],
-                                full_info: UserFullInfo::builder().build(),
-                                status: UserStatus::from_json(obj["user"]["status"].to_string())
-                                    .unwrap(),
-                            });
+                    // Send Tdlib database encryption key
+                    AuthorizationState::WaitEncryptionKey(_) => send_check_encryption_key(&tdlib),
+
+                    // Tdlib is waiting for phone number
+                    AuthorizationState::WaitPhoneNumber(_) => {
+                        send_phone_parameters(&tdlib, &phone_number);
                     }
 
-                    // Received an update to users status (online/offline/etc.)
-                    "updateUserStatus" => {
-                        let uid = obj["user_id"].as_i64().unwrap();
-                        app.users.lock().unwrap().entry(uid).and_modify(|tu| {
-                            tu.status = UserStatus::from_json(obj["status"].to_string()).unwrap();
-                        });
-                    }
-
-                    // Received information about a basic group
-                    "updateBasicGroup" => {
-                        // Parse JSON as Basic Group and insert (or update) to HashMap
-                        let new_group = TBasicGroup {
-                            g: BasicGroup::from_json(obj["basic_group"].to_string()).unwrap(),
-                            full_info: BasicGroupFullInfo::default(),
-                        };
-                        app.basic_groups
-                            .lock()
-                            .unwrap()
-                            .insert(new_group.g.id(), new_group);
-                    }
-                    // Received full information about a basic group
-                    "updateBasicGroupFullInfo" => {
-                        // Parse JSON as Basic Group and insert (or update) to HashMap
-                        app.basic_groups
-                            .lock()
-                            .unwrap()
-                            .entry(obj["basic_group_id"].as_i64().unwrap())
-                            .and_modify(|bgf| {
-                                bgf.full_info = BasicGroupFullInfo::from_json(
-                                    obj["basic_group_full_info"].to_string(),
-                                )
-                                .unwrap()
-                            });
-                    }
-
-                    // Received information about a chat of which we've not heard before
-                    "updateNewChat" => {
-                        let new_chat = &mut obj["chat"];
-
-                        // Add attributes to new_chat that are expected by rtdlib,
-                        // but not provided by the API
-                        new_chat["order"] = serde_json::from_str("1").unwrap();
-                        new_chat["is_pinned"] = serde_json::from_value(json!(false)).unwrap();
-                        new_chat["is_sponsored"] = serde_json::from_value(json!(false)).unwrap();
-                        new_chat["pinned_message_id"] = serde_json::from_value(json!(0)).unwrap();
-
-                        // Add TChat to chat list
-                        let tchat = TChat::from_json(new_chat.to_string());
-                        app.chat_list.chat_vec.lock().unwrap().push(tchat);
-                    }
-
-                    // Received information about a message of which we've not heard before
-                    "updateNewMessage" => {
-                        let msg = &mut obj["message"];
-                        let chat_id = match msg["chat_id"].as_i64() {
-                            Some(ok) => ok,
-                            None => panic!("Couldn't get id: {}", msg),
+                    // Tdlib is awaiting authorization code that was sent
+                    // to user via Telegram, SMS, or otherwise
+                    AuthorizationState::WaitCode(_) => {
+                        // Get code argument from command line args
+                        let input_code = match get_arg(CODE_ARG) {
+                            Some(c) => c,
+                            None => {
+                                // Code was needed but not provided,
+                                // so exit and tell user to run again, providing code
+                                eprintln!("{}", NO_CODE_PROVIDED);
+                                tx.send(MsgCode::Exit).unwrap();
+                                return;
+                            }
                         };
 
-                        // Determine the chat to which message belongs
-                        let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
-                        let mut cur_chat_history = cur_chat.history.lock().unwrap();
+                        // Check provided auth code against Tdlib's expectation
+                        let check_auth_code = CheckAuthenticationCode::builder()
+                            .code(input_code.trim())
+                            .build();
 
-                        // Parse message into rtdlib::Message type
-                        let cur_msg = parse_msg(msg, chat_id);
-                        // Place at start, rather than push to end
-                        cur_chat_history.insert(0, cur_msg);
-                        cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
-                    }
-
-                    // Received a list of messages, initiated by GetChatHistory call
-                    "messages" => {
-                        let msg_count = obj["total_count"].as_u64().unwrap();
-                        let msg_list = &mut obj["messages"];
-                        let chat_id = match msg_list[0]["chat_id"].as_i64() {
-                            Some(ok) => ok,
-                            None => panic!("Couldn't get id: {}", msg_list),
-                        };
-                        let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
-
-                        // If received at least one message, insert into history
-                        if msg_count > 0 {
-                            let mut cur_chat_history = cur_chat.history.lock().unwrap();
-                            for cur_msg in msg_list.as_array_mut().unwrap() {
-                                let cur_msg = parse_msg(cur_msg, chat_id);
-                                cur_chat_history.push(cur_msg);
-                            }
-                            cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
-                        // If no messages received, have evidently reached end of chat history
-                        } else {
-                            cur_chat.end_of_history = true;
-                        }
-                    }
-                    "error" => {
-                        let msg = obj["message"].as_str().unwrap();
-                        let mut is_fatal = false;
-                        let error_msg = match msg {
-                            "PHONE_CODE_INVALID" => {
-                                is_fatal = true;
-                                "Incorrect code. Please try again."
-                            }
-                            _ => msg,
-                        };
-                        eprintln!("{}", error_msg);
-                        if is_fatal {
-                            tx.send(MsgCode::Exit).unwrap();
-                            return;
-                        }
+                        tdlib.send(&check_auth_code.to_json().unwrap());
                     }
                     _ => {
-                        eprintln!("Unhandled message: {}", obj);
+                        eprintln!("unhandled auth case!: {}", astate.to_json().unwrap());
                     }
                 }
             }
-            // When nothing received after timeout, go ahead and send any queued requests
-            None => {
-                let sz = app.outgoing_queue.lock().unwrap().len();
-                // Send each request in queue, in order
-                for _ in 0..sz {
-                    let s = app.outgoing_queue.lock().unwrap().pop_front().unwrap();
-                    tdlib.send(&s);
+
+            // Received user information. Can be new or an update to an existing
+            "updateUser" => {
+                let num_users = app.users.lock().unwrap().len();
+                let uid = obj["user"]["id"].as_i64().unwrap();
+                // Create TUser, parsing JSON as a User and determining name color,
+                // or update if already exists
+                app.users
+                    .lock()
+                    .unwrap()
+                    .entry(uid)
+                    .and_modify(|tu| tu.u = User::from_json(obj["user"].to_string()).unwrap())
+                    .or_insert(TUser {
+                        u: User::from_json(obj["user"].to_string()).unwrap(),
+                        // Calculate the next color to use, maintaining maximum variety
+                        color: COLORS[num_users % COLORS.len()],
+                        full_info: UserFullInfo::builder().build(),
+                        status: UserStatus::from_json(obj["user"]["status"].to_string()).unwrap(),
+                    });
+            }
+
+            // Received an update to users status (online/offline/etc.)
+            "updateUserStatus" => {
+                let uid = obj["user_id"].as_i64().unwrap();
+                app.users.lock().unwrap().entry(uid).and_modify(|tu| {
+                    tu.status = UserStatus::from_json(obj["status"].to_string()).unwrap();
+                });
+            }
+
+            // Received information about a basic group
+            "updateBasicGroup" => {
+                // Parse JSON as Basic Group and insert (or update) to HashMap
+                let new_group = TBasicGroup {
+                    g: BasicGroup::from_json(obj["basic_group"].to_string()).unwrap(),
+                    full_info: BasicGroupFullInfo::default(),
+                };
+                app.basic_groups
+                    .lock()
+                    .unwrap()
+                    .insert(new_group.g.id(), new_group);
+            }
+            // Received full information about a basic group
+            "updateBasicGroupFullInfo" => {
+                // Parse JSON as Basic Group and insert (or update) to HashMap
+                app.basic_groups
+                    .lock()
+                    .unwrap()
+                    .entry(obj["basic_group_id"].as_i64().unwrap())
+                    .and_modify(|bgf| {
+                        bgf.full_info =
+                            BasicGroupFullInfo::from_json(obj["basic_group_full_info"].to_string())
+                                .unwrap()
+                    });
+            }
+
+            // Received information about a chat of which we've not heard before
+            "updateNewChat" => {
+                let new_chat = &mut obj["chat"];
+
+                // Add attributes to new_chat that are expected by rtdlib,
+                // but not provided by the API
+                new_chat["order"] = serde_json::from_str("1").unwrap();
+                new_chat["is_pinned"] = serde_json::from_value(json!(false)).unwrap();
+                new_chat["is_sponsored"] = serde_json::from_value(json!(false)).unwrap();
+                new_chat["pinned_message_id"] = serde_json::from_value(json!(0)).unwrap();
+
+                // Add TChat to chat list
+                let tchat = TChat::from_json(new_chat.to_string());
+                app.chat_list.chat_vec.lock().unwrap().push(tchat);
+            }
+
+            // Received information about a message of which we've not heard before
+            "updateNewMessage" => {
+                let msg = &mut obj["message"];
+                let chat_id = match msg["chat_id"].as_i64() {
+                    Some(ok) => ok,
+                    None => panic!("Couldn't get id: {}", msg),
+                };
+
+                // Determine the chat to which message belongs
+                let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
+                let mut cur_chat_history = cur_chat.history.lock().unwrap();
+
+                // Parse message into rtdlib::Message type
+                let cur_msg = parse_msg(msg, chat_id);
+                // Place at start, rather than push to end
+                cur_chat_history.insert(0, cur_msg);
+                //cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
+                //cur_chat_history.dedup_by(|a, b| a.id() == b.id());
+            }
+
+            // Received a list of messages, initiated by GetChatHistory call
+            "messages" => {
+                let msg_count = obj["total_count"].as_u64().unwrap();
+                let msg_list = &mut obj["messages"];
+                let chat_id = match msg_list[0]["chat_id"].as_i64() {
+                    Some(ok) => ok,
+                    None => panic!("Couldn't get id: {}", msg_list),
+                };
+                let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
+
+                // If received at least one message, insert into history
+                if msg_count > 0 {
+                    let mut cur_chat_history = cur_chat.history.lock().unwrap();
+                    for cur_msg in msg_list.as_array_mut().unwrap() {
+                        let cur_msg = parse_msg(cur_msg, chat_id);
+                        cur_chat_history.push(cur_msg);
+                    }
+                    cur_chat.retrieving = -1;
+                // cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
+                //cur_chat_history.dedup_by(|a, b| a.id() == b.id());
+                // If no messages received, have evidently reached end of chat history
+                } else {
+                    cur_chat.end_of_history = true;
                 }
+            }
+            "error" => {
+                let msg = obj["message"].as_str().unwrap();
+                let mut is_fatal = false;
+                let error_msg = match msg {
+                    "PHONE_CODE_INVALID" => {
+                        is_fatal = true;
+                        "Incorrect code. Please try again."
+                    }
+                    _ => msg,
+                };
+                eprintln!("{}", error_msg);
+                if is_fatal {
+                    tx.send(MsgCode::Exit).unwrap();
+                    return;
+                }
+            }
+            _ => {
+                eprintln!("Unhandled message: {}", obj);
             }
         }
     }
@@ -766,13 +765,10 @@ fn ui_thread(
     let mut chat_box_width: usize = 0;
     let mut start_corner = Corner::BottomLeft;
     loop {
-        match rx.try_recv() {
-            Ok(c) => match c {
-                MsgCode::Exit => {
-                    return Ok(());
-                }
-            },
-            Err(_) => {}
+        if let Ok(c) = rx.try_recv() {
+            match c {
+                MsgCode::Exit => return Ok(()),
+            }
         }
 
         terminal.draw(|f| {
@@ -818,12 +814,13 @@ fn ui_thread(
                 chat.num_onscreen = displayed_msgs;
                 //TODO: fix end of history
                 let oldest_id = chat.get_oldest_id();
-                if history_height < chat_box_height.into()
-                    && !chat.end_of_history
-                    && chat.retrieving != oldest_id
-                {
-                    chat.retrieving = oldest_id;
-                    chat.retrieve_history(&app.outgoing_queue, oldest_id, chat_box_height as i64);
+                if history_height < chat_box_height.into() && !chat.end_of_history {
+                    //TODO: don't send duplicate requests
+                    chat.retrieve_history(
+                        &app.outgoing_queue,
+                        oldest_id,
+                        (chat_box_height * 2) as i64,
+                    );
                 }
                 start_corner = match chat.last_scroll_direction {
                     ScrollDirection::Up => Corner::BottomLeft,
@@ -1087,12 +1084,9 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
                         .build(),
                 ))
                 .chat_id(chat_id)
-                .sender_user_id(
-                    cur_msg["sender_user_id"]
-                        .to_string()
-                        .parse::<i64>()
-                        .unwrap(),
-                )
+                .id(cur_msg["id"].as_i64().unwrap())
+                .date(cur_msg["date"].as_i64().unwrap())
+                .sender_user_id(cur_msg["sender_user_id"].as_i64().unwrap())
                 .build()
         }
         Ok(ok) => ok,
@@ -1101,5 +1095,9 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
 }
 
 fn msg_sort_helper(a: &Message, b: &Message) -> std::cmp::Ordering {
-    b.date().cmp(&a.date())
+    if a.date().eq(&b.date()) {
+        a.id().cmp(&b.id())
+    } else {
+        b.date().cmp(&a.date())
+    }
 }
