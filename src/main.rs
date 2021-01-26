@@ -118,7 +118,7 @@ struct Chats {
     name: &'static str,
 
     // Index within chat_vec of currently selected chat
-    selected_index: i32,
+    selected_index: Arc<Mutex<i32>>,
 }
 
 // A wrapper for Tdlib User with extra information
@@ -157,10 +157,16 @@ struct TChat {
     // Direction in which last scroll went. Used to determine rendering and assure continuity
     // e.g. when user pages down, the new top message should be the previous bottom one
     last_scroll_direction: ScrollDirection,
+
+    // Timestamp of most recent message in chat
+    last_msg_date: Arc<Mutex<i64>>,
 }
 impl App {}
 
 impl TChat {
+    fn set_last_msg_date(&mut self, d: i64) {
+        *self.last_msg_date.lock().unwrap() = d;
+    }
     // Retrieve history of messages in chat, starting at message with id `start_id`,
     // retrieving up to `limit` messages, and placing the final request in `queue`, which
     // is generally the app output queue
@@ -209,6 +215,8 @@ impl TChat {
 
             // By default, start rendering from the bottom
             last_scroll_direction: ScrollDirection::Up,
+            //last_msg_date: -1,
+            last_msg_date: Arc::new(Mutex::new(-1)),
         }
     }
 }
@@ -260,6 +268,47 @@ impl Chats {
             }
         }
         None
+    }
+    fn set_selected_index(&mut self, i: i32) {
+        *self.selected_index.lock().unwrap() = i;
+    }
+
+    fn selected_index(&self) -> usize {
+        return *self.selected_index.lock().unwrap() as usize;
+    }
+
+    fn sort(&mut self) {
+        let id_of_selected = self
+            .chat_vec
+            .lock()
+            .unwrap()
+            .get(self.selected_index())
+            .unwrap()
+            .chat
+            .id();
+        self.chat_vec.lock().unwrap().sort_by(|a, b| {
+            b.last_msg_date
+                .lock()
+                .unwrap()
+                .cmp(&a.last_msg_date.lock().unwrap())
+        });
+        let new_id_of_selected = self
+            .chat_vec
+            .lock()
+            .unwrap()
+            .get(self.selected_index())
+            .unwrap()
+            .chat
+            .id();
+
+        if id_of_selected != new_id_of_selected {
+            for (i, c) in self.chat_vec.lock().unwrap().iter().enumerate() {
+                if c.chat.id() == id_of_selected {
+                    *self.selected_index.lock().unwrap() = i as i32;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -316,8 +365,8 @@ impl TBlock for Chats {
     fn new(name: &'static str) -> Chats {
         Chats {
             chat_vec: Arc::new(Mutex::new(Vec::new())),
+            selected_index: Arc::new(Mutex::new(0)),
             name,
-            selected_index: 0,
         }
     }
 
@@ -332,19 +381,20 @@ impl TBlock for Chats {
         }
     }
 
-    // Go up by one chat
     fn scroll_up(&mut self) {
-        self.selected_index = (self.selected_index - 1) % self.get_len().unwrap();
+        let mut selected_index = self.selected_index() as i32;
+        // Go up by one chat
+        selected_index = (selected_index - 1) % self.get_len().unwrap();
 
-        // Wrap around to bottom of list
-        if self.selected_index < 0 {
-            self.selected_index = self.get_len().unwrap() - 1;
+        if selected_index < 0 {
+            selected_index = self.get_len().unwrap() - 1;
         }
+        self.set_selected_index(selected_index);
     }
 
     fn scroll_down(&mut self) {
         // Wrap around to top of list
-        self.selected_index = (self.selected_index + 1) % self.get_len().unwrap();
+        self.set_selected_index((self.selected_index() as i32 + 1) % self.get_len().unwrap());
     }
     fn page_down(&mut self) {}
     fn page_up(&mut self) {}
@@ -361,6 +411,7 @@ impl TBlock for TChat {
             bottom_index: 0,
             // By default, start rendering from bottom
             last_scroll_direction: ScrollDirection::Up,
+            last_msg_date: Arc::new(Mutex::new(-1)),
         }
     }
     // Go all the way to the bottom (e.g. newest message)
@@ -677,6 +728,15 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
                 app.chat_list.chat_vec.lock().unwrap().push(tchat);
             }
 
+            "updateChatLastMessage" => {
+                let chat_id = obj["chat_id"].as_i64().unwrap();
+                app.chat_list
+                    .get_chat_by_id(chat_id)
+                    .unwrap()
+                    .set_last_msg_date(obj["last_message"]["date"].as_i64().unwrap());
+                app.chat_list.sort();
+            }
+
             // Received information about a message of which we've not heard before
             "updateNewMessage" => {
                 let msg = &mut obj["message"];
@@ -799,7 +859,7 @@ fn ui_thread(
                 .enumerate()
             {
                 let chat_list_item = ListItem::new(Text::from(String::from(chat.chat.title())));
-                if app.chat_list.selected_index != (i as i32) {
+                if app.chat_list.selected_index() != i {
                     // Not selected, style as default and skip ahead to next
                     chat_titles.push(chat_list_item.style(unselected_style));
                     continue;
@@ -929,20 +989,21 @@ fn ui_thread(
                                 .chat_vec
                                 .lock()
                                 .unwrap()
-                                .get_mut(app.chat_list.selected_index as usize)
+                                .get_mut(*app.chat_list.selected_index.lock().unwrap() as usize)
                                 .unwrap()
                                 .handle_input_normal(&app.outgoing_queue, &input);
                         }
                         _ => {}
                     },
                 },
+                //TODO: get_cur_chat_function
                 InputMode::Insert => {
                     let cur_chat_id = app
                         .chat_list
                         .chat_vec
                         .lock()
                         .unwrap()
-                        .get(app.chat_list.selected_index as usize)
+                        .get((*app.chat_list.selected_index.lock().unwrap()) as usize)
                         .unwrap()
                         .chat
                         .id();
@@ -1026,7 +1087,6 @@ fn build_msg_list(
                 )];
                 let msg_slice: String = (*l).chars().skip(send_len).collect();
                 first_line.push(Span::styled(msg_slice, text_style));
-                //lis = Text::from(Spans::from(first_line));
                 lis.push(Spans::from(first_line));
                 continue;
             }
