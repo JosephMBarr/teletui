@@ -173,7 +173,6 @@ impl TChat {
         if self.retrieving == start_id {
             return;
         }
-        eprintln!("retrieving from {}", start_id);
         self.retrieving = start_id;
         let chat_history_req = GetChatHistory::builder()
             .chat_id(self.chat.id())
@@ -222,6 +221,7 @@ trait TBlock {
     fn scroll_up(&mut self) {}
     fn page_down(&mut self) {}
     fn page_up(&mut self) {}
+    fn go_to_bottom(&mut self) {}
     fn get_len(&self) -> Result<i32, io::Error> {
         Ok(-1)
     }
@@ -242,6 +242,7 @@ trait TBlock {
         match input {
             Key::Char('j') => self.scroll_down(),
             Key::Char('k') => self.scroll_up(),
+            Key::Char('G') => self.go_to_bottom(),
             Key::Ctrl('f') => self.page_down(),
             Key::Ctrl('b') => self.page_up(),
             _ => {}
@@ -361,6 +362,10 @@ impl TBlock for TChat {
             // By default, start rendering from bottom
             last_scroll_direction: ScrollDirection::Up,
         }
+    }
+    // Go all the way to the bottom (e.g. newest message)
+    fn go_to_bottom(&mut self) {
+        self.bottom_index = 0;
     }
 
     // Scroll up such that the topmost message becomes the bottom one
@@ -688,8 +693,6 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
                 let cur_msg = parse_msg(msg, chat_id);
                 // Place at start, rather than push to end
                 cur_chat_history.insert(0, cur_msg);
-                //cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
-                //cur_chat_history.dedup_by(|a, b| a.id() == b.id());
             }
 
             // Received a list of messages, initiated by GetChatHistory call
@@ -710,8 +713,6 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
                         cur_chat_history.push(cur_msg);
                     }
                     cur_chat.retrieving = -1;
-                // cur_chat_history.sort_by(|a, b| msg_sort_helper(a, b));
-                //cur_chat_history.dedup_by(|a, b| a.id() == b.id());
                 // If no messages received, have evidently reached end of chat history
                 } else {
                     cur_chat.end_of_history = true;
@@ -815,7 +816,6 @@ fn ui_thread(
                 //TODO: fix end of history
                 let oldest_id = chat.get_oldest_id();
                 if history_height < chat_box_height.into() && !chat.end_of_history {
-                    //TODO: don't send duplicate requests
                     chat.retrieve_history(
                         &app.outgoing_queue,
                         oldest_id,
@@ -1010,8 +1010,12 @@ fn build_msg_list(
 
         let full_msg = format!("{}: {}", sender_name, msg_text);
         let lines = textwrap::fill(&full_msg, chat_box_width);
-        let mut lis = Text::from("");
+        //let mut lis = Text::from("");
+        let mut lis = Vec::new();
         for (i, l) in lines.lines().enumerate() {
+            if l.len() == 0 {
+                continue;
+            }
             history_height += 1;
             if i == 0 {
                 let mut first_line = vec![Span::styled(
@@ -1022,16 +1026,26 @@ fn build_msg_list(
                 )];
                 let msg_slice: String = (*l).chars().skip(send_len).collect();
                 first_line.push(Span::styled(msg_slice, text_style));
-                lis = Text::from(Spans::from(first_line));
+                //lis = Text::from(Spans::from(first_line));
+                lis.push(Spans::from(first_line));
                 continue;
             }
             let t = Text::styled((*l).to_owned(), text_style).to_owned();
-            lis.extend(t);
+            lis.extend(t.lines);
         }
-        if history_height > chat_box_height {
+
+        // Peel off lines from the start of the topmost message to display partial message
+        // when cut off
+        while history_height > chat_box_height {
+            lis.remove(0);
+            history_height -= 1;
+        }
+        let t = Text::from(lis);
+        chat_history.push(ListItem::new(t));
+
+        if history_height >= chat_box_height {
             break;
         }
-        chat_history.push(ListItem::new(lis));
     }
     return (chat_history.len(), history_height);
 }
@@ -1092,12 +1106,4 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
         Ok(ok) => ok,
     };
     return cur_msg;
-}
-
-fn msg_sort_helper(a: &Message, b: &Message) -> std::cmp::Ordering {
-    if a.date().eq(&b.date()) {
-        a.id().cmp(&b.id())
-    } else {
-        b.date().cmp(&a.date())
-    }
 }
