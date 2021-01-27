@@ -51,11 +51,6 @@ enum MsgCode {
 }
 
 #[derive(Clone)]
-enum ScrollDirection {
-    Up,
-    Down,
-}
-#[derive(Clone)]
 enum InputMode {
     Normal,
     Insert,
@@ -118,7 +113,7 @@ struct Chats {
     name: &'static str,
 
     // Index within chat_vec of currently selected chat
-    selected_index: Arc<Mutex<i32>>,
+    selected_index: Arc<Mutex<usize>>,
 }
 
 // A wrapper for Tdlib User with extra information
@@ -153,10 +148,6 @@ struct TChat {
 
     // Index (within history) of the message at the bottom of the screen
     bottom_index: usize,
-
-    // Direction in which last scroll went. Used to determine rendering and assure continuity
-    // e.g. when user pages down, the new top message should be the previous bottom one
-    last_scroll_direction: ScrollDirection,
 
     // Timestamp of most recent message in chat
     last_msg_date: Arc<Mutex<i64>>,
@@ -213,9 +204,6 @@ impl TChat {
             num_onscreen: 0,
             bottom_index: 0,
 
-            // By default, start rendering from the bottom
-            last_scroll_direction: ScrollDirection::Up,
-            //last_msg_date: -1,
             last_msg_date: Arc::new(Mutex::new(-1)),
         }
     }
@@ -230,8 +218,8 @@ trait TBlock {
     fn page_down(&mut self) {}
     fn page_up(&mut self) {}
     fn go_to_bottom(&mut self) {}
-    fn get_len(&self) -> Result<i32, io::Error> {
-        Ok(-1)
+    fn get_len(&self) -> usize {
+        0
     }
     fn handle_input_insert(
         &mut self,
@@ -269,42 +257,31 @@ impl Chats {
         }
         None
     }
-    fn set_selected_index(&mut self, i: i32) {
+    fn get_chat_id_by_index(&self, i: usize) -> i64 {
+        return self.chat_vec.lock().unwrap().get(i).unwrap().chat.id();
+    }
+    fn set_selected_index(&mut self, i: usize) {
         *self.selected_index.lock().unwrap() = i;
     }
 
     fn selected_index(&self) -> usize {
-        return *self.selected_index.lock().unwrap() as usize;
+        return *self.selected_index.lock().unwrap();
     }
 
     fn sort(&mut self) {
-        let id_of_selected = self
-            .chat_vec
-            .lock()
-            .unwrap()
-            .get(self.selected_index())
-            .unwrap()
-            .chat
-            .id();
+        let id_of_selected = self.get_chat_id_by_index(self.selected_index());
         self.chat_vec.lock().unwrap().sort_by(|a, b| {
             b.last_msg_date
                 .lock()
                 .unwrap()
                 .cmp(&a.last_msg_date.lock().unwrap())
         });
-        let new_id_of_selected = self
-            .chat_vec
-            .lock()
-            .unwrap()
-            .get(self.selected_index())
-            .unwrap()
-            .chat
-            .id();
+        let new_id_of_selected = self.get_chat_id_by_index(self.selected_index());
 
         if id_of_selected != new_id_of_selected {
             for (i, c) in self.chat_vec.lock().unwrap().iter().enumerate() {
                 if c.chat.id() == id_of_selected {
-                    *self.selected_index.lock().unwrap() = i as i32;
+                    *self.selected_index.lock().unwrap() = i as usize;
                     break;
                 }
             }
@@ -371,30 +348,26 @@ impl TBlock for Chats {
     }
 
     // Get number of chats
-    fn get_len(&self) -> Result<i32, io::Error> {
-        let cur_size: usize = self.chat_vec.lock().unwrap().len();
-        if cur_size > u32::MAX as usize {
-            let e = Error::new(ErrorKind::Other, "too many chats!");
-            Err(e)
-        } else {
-            Ok(cur_size as i32)
-        }
+    fn get_len(&self) -> usize {
+        return self.chat_vec.lock().unwrap().len();
     }
 
     fn scroll_up(&mut self) {
-        let mut selected_index = self.selected_index() as i32;
-        // Go up by one chat
-        selected_index = (selected_index - 1) % self.get_len().unwrap();
+        let mut selected_index = self.selected_index();
 
-        if selected_index < 0 {
-            selected_index = self.get_len().unwrap() - 1;
+        // Wrap around when going over top
+        if selected_index == 0 {
+            selected_index = self.get_len() - 1;
         }
+        // Go up by one chat
+        selected_index = (selected_index + 1) % self.get_len();
+
         self.set_selected_index(selected_index);
     }
 
     fn scroll_down(&mut self) {
         // Wrap around to top of list
-        self.set_selected_index((self.selected_index() as i32 + 1) % self.get_len().unwrap());
+        self.set_selected_index((self.selected_index() + 1) % self.get_len());
     }
     fn page_down(&mut self) {}
     fn page_up(&mut self) {}
@@ -409,8 +382,6 @@ impl TBlock for TChat {
             retrieving: -1,
             num_onscreen: 0,
             bottom_index: 0,
-            // By default, start rendering from bottom
-            last_scroll_direction: ScrollDirection::Up,
             last_msg_date: Arc::new(Mutex::new(-1)),
         }
     }
@@ -419,20 +390,18 @@ impl TBlock for TChat {
         self.bottom_index = 0;
     }
 
+    fn get_len(&self) -> usize {
+        return self.history.lock().unwrap().len();
+    }
+
     // Scroll up such that the topmost message becomes the bottom one
     fn page_up(&mut self) {
-        self.last_scroll_direction = ScrollDirection::Up;
         self.bottom_index += self.num_onscreen;
     }
     //TODO: fiddle with scrolling off-by-one
     fn page_down(&mut self) {
-        self.last_scroll_direction = ScrollDirection::Down;
-
         // If the bottom message is also the newest one, make sure it's flush
         // with the bottom of the box, as to avoid blank gaps at bottom
-        if (self.bottom_index as i64 - self.num_onscreen as i64) <= self.num_onscreen as i64 {
-            self.last_scroll_direction = ScrollDirection::Up;
-        }
         if (self.bottom_index as i64 - self.num_onscreen as i64) <= 0 {
             self.bottom_index = 0;
             return;
@@ -442,17 +411,13 @@ impl TBlock for TChat {
         self.bottom_index -= self.num_onscreen;
     }
     fn scroll_up(&mut self) {
-        self.last_scroll_direction = ScrollDirection::Up;
-        self.bottom_index += 1;
+        if self.bottom_index + self.num_onscreen < self.get_len() {
+            self.bottom_index += 1;
+        }
     }
     fn scroll_down(&mut self) {
-        self.last_scroll_direction = ScrollDirection::Down;
-
         // Use same safeguard as paging down to ensure bottom message is always flush with
         // bottom of box
-        if (self.bottom_index as i64 - self.num_onscreen as i64) <= self.num_onscreen as i64 {
-            self.last_scroll_direction = ScrollDirection::Up;
-        }
         if self.bottom_index as i64 <= 0 {
             self.bottom_index = 0;
             return;
@@ -757,25 +722,26 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
 
             // Received a list of messages, initiated by GetChatHistory call
             "messages" => {
+                eprintln!("messages is {}", obj);
                 let msg_count = obj["total_count"].as_u64().unwrap();
                 let msg_list = &mut obj["messages"];
                 let chat_id = match msg_list[0]["chat_id"].as_i64() {
                     Some(ok) => ok,
-                    None => panic!("Couldn't get id: {}", msg_list),
+                    None => {
+                        eprintln!("Couldn't get id: {}", obj);
+                        continue;
+                    }
                 };
-                let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
 
                 // If received at least one message, insert into history
                 if msg_count > 0 {
+                    let cur_chat = &mut app.chat_list.get_chat_by_id(chat_id).unwrap();
                     let mut cur_chat_history = cur_chat.history.lock().unwrap();
                     for cur_msg in msg_list.as_array_mut().unwrap() {
                         let cur_msg = parse_msg(cur_msg, chat_id);
                         cur_chat_history.push(cur_msg);
                     }
                     cur_chat.retrieving = -1;
-                // If no messages received, have evidently reached end of chat history
-                } else {
-                    cur_chat.end_of_history = true;
                 }
             }
             "error" => {
@@ -824,7 +790,6 @@ fn ui_thread(
     terminal.clear()?;
     let mut chat_box_height = 0;
     let mut chat_box_width: usize = 0;
-    let mut start_corner = Corner::BottomLeft;
     loop {
         if let Ok(c) = rx.try_recv() {
             match c {
@@ -875,17 +840,16 @@ fn ui_thread(
                 chat.num_onscreen = displayed_msgs;
                 //TODO: fix end of history
                 let oldest_id = chat.get_oldest_id();
-                if history_height < chat_box_height.into() && !chat.end_of_history {
+                if (history_height < chat_box_height.into()
+                    || chat.bottom_index + 2 * chat.num_onscreen >= chat_history.len())
+                    && !chat.end_of_history
+                {
                     chat.retrieve_history(
                         &app.outgoing_queue,
                         oldest_id,
                         (chat_box_height * 2) as i64,
                     );
                 }
-                start_corner = match chat.last_scroll_direction {
-                    ScrollDirection::Up => Corner::BottomLeft,
-                    ScrollDirection::Down => Corner::TopLeft,
-                };
                 let extra_info = if chat.chat.type_().is_private() {
                     // Get user and the time they were last seen
                     let recipient_id = chat.chat.type_().as_private().unwrap().user_id();
@@ -933,7 +897,7 @@ fn ui_thread(
             );
             let mut chat_block = List::new(chat_history)
                 .block(Block::default().title(chat_title).borders(Borders::ALL))
-                .start_corner(start_corner);
+                .start_corner(Corner::BottomLeft);
 
             let mut input_block = Block::default()
                 .title(app.input_box.name)
@@ -1043,22 +1007,13 @@ fn build_msg_list(
     // Track total number of messages displayed, for tracking scroll
 
     let h = chat.history.lock().unwrap();
-    let mut temp_vec = vec![Message::builder().build(); chat.bottom_index];
-    let chat_slice = match chat.last_scroll_direction {
-        ScrollDirection::Up => h[chat.bottom_index..].iter(),
-        ScrollDirection::Down => {
-            temp_vec.clone_from_slice(&h[..chat.bottom_index]);
-            temp_vec.reverse();
-            temp_vec.iter()
-        }
-    };
 
     let mut history_height = 0;
     let text_style = Style::default()
         .remove_modifier(Modifier::BOLD)
         .fg(Color::White);
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
-    for msg in chat_slice {
+    for msg in h[chat.bottom_index..].iter() {
         let msg_text = match msg.content().as_message_text() {
             Some(s) => s.text().text().to_string(),
             None => "[none]".to_string(),
