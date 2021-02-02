@@ -17,7 +17,7 @@ use tui::{
     layout::{Constraint, Corner, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 // Seconds to wait for message form Tdlib
@@ -54,6 +54,20 @@ enum MsgCode {
 enum InputMode {
     Normal,
     Insert,
+    Visual,
+}
+#[derive(Clone)]
+enum MsgAction {
+    _Edit,
+    Reply,
+    _Delete,
+}
+
+#[derive(Clone)]
+enum MsgState {
+    Normal,
+    _Edit,
+    Reply,
 }
 
 // TUI Blocks
@@ -74,6 +88,7 @@ struct App {
     basic_groups: Arc<Mutex<HashMap<i64, TBasicGroup>>>,
     chat_list: Chats,
     input_box: InputBox,
+    chat_history_state: ListState,
 }
 impl App {
     fn new() -> App {
@@ -84,6 +99,7 @@ impl App {
             basic_groups: Arc::new(Mutex::new(HashMap::new())),
             chat_list: Chats::new("Chats"),
             input_box: InputBox::new("Input"),
+            chat_history_state: ListState::default(),
         }
     }
 }
@@ -151,10 +167,36 @@ struct TChat {
 
     // Timestamp of most recent message in chat
     last_msg_date: Arc<Mutex<i64>>,
+
+    // Index of currently selected index in visual mode
+    select_index: usize,
+
+    // What to do with what's going in input box (new message, edit, reply, etc.)
+    msg_state: MsgState,
 }
 impl App {}
 
 impl TChat {
+    fn select_up(&mut self) {
+        if self.select_index >= self.num_onscreen {
+            self.select_index = 0;
+        } else {
+            self.select_index += 1;
+        }
+    }
+    fn select_msg(&mut self, action: MsgAction) {
+        match action {
+            MsgAction::Reply => self.msg_state = MsgState::Reply,
+            _ => {}
+        }
+    }
+    fn select_down(&mut self) {
+        if self.select_index == 0 {
+            self.select_index = self.num_onscreen - 1;
+        } else {
+            self.select_index -= 1;
+        }
+    }
     fn set_last_msg_date(&mut self, d: i64) {
         *self.last_msg_date.lock().unwrap() = d;
     }
@@ -196,16 +238,9 @@ impl TChat {
 
     // Create a TChat from a JSON string of a Tdlib Chat
     fn from_json(j: String) -> TChat {
-        TChat {
-            chat: Chat::from_json(j).unwrap(),
-            history: Arc::new(Mutex::new(Vec::new())),
-            end_of_history: false,
-            retrieving: -1,
-            num_onscreen: 0,
-            bottom_index: 0,
-
-            last_msg_date: Arc::new(Mutex::new(-1)),
-        }
+        let mut t = TChat::new("Chat");
+        t.chat = Chat::from_json(j).unwrap();
+        return t;
     }
 }
 
@@ -222,6 +257,13 @@ trait TBlock {
         0
     }
     fn handle_input_insert(
+        &mut self,
+        _queue: &Arc<Mutex<VecDeque<String>>>,
+        _input: &termion::event::Key,
+        _cur_chat: &mut TChat,
+    ) {
+    }
+    fn handle_input_visual(
         &mut self,
         _queue: &Arc<Mutex<VecDeque<String>>>,
         _input: &termion::event::Key,
@@ -257,8 +299,11 @@ impl Chats {
         }
         None
     }
-    fn get_chat_id_by_index(&self, i: usize) -> i64 {
-        return self.chat_vec.lock().unwrap().get(i).unwrap().chat.id();
+    fn get_chat_id_by_index(&self, i: usize) -> Option<i64> {
+        match self.chat_vec.lock().unwrap().get(i) {
+            Some(c) => Some(c.chat.id()),
+            None => None,
+        }
     }
     fn set_selected_index(&mut self, i: usize) {
         *self.selected_index.lock().unwrap() = i;
@@ -269,14 +314,17 @@ impl Chats {
     }
 
     fn sort(&mut self) {
-        let id_of_selected = self.get_chat_id_by_index(self.selected_index());
+        let id_of_selected = match self.get_chat_id_by_index(self.selected_index()) {
+            Some(i) => i,
+            None => return,
+        };
         self.chat_vec.lock().unwrap().sort_by(|a, b| {
             b.last_msg_date
                 .lock()
                 .unwrap()
                 .cmp(&a.last_msg_date.lock().unwrap())
         });
-        let new_id_of_selected = self.get_chat_id_by_index(self.selected_index());
+        let new_id_of_selected = self.get_chat_id_by_index(self.selected_index()).unwrap();
 
         if id_of_selected != new_id_of_selected {
             for (i, c) in self.chat_vec.lock().unwrap().iter().enumerate() {
@@ -293,14 +341,26 @@ impl Chats {
 impl InputBox {
     // Creates message to be sent to chat, using passed in chat ID and the contents of
     // the input string
-    fn send_message(&mut self, cur_chat_id: i64, queue: &Arc<Mutex<VecDeque<String>>>) {
+    fn send_message(&mut self, cur_chat: &mut TChat, queue: &Arc<Mutex<VecDeque<String>>>) {
         let msg = InputMessageContent::InputMessageText(
             InputMessageText::builder()
                 .text(FormattedText::builder().text(self.input_str.clone()))
                 .build(),
         );
+        let h = cur_chat.history.lock().unwrap();
+        let reply_to_message_id = match cur_chat.msg_state {
+            MsgState::Reply => {
+                // Get the message that is being replied to, based on history offset
+                // and on screen index
+                h.get(cur_chat.bottom_index + cur_chat.select_index)
+                    .unwrap()
+                    .id()
+            }
+            _ => 0,
+        };
         let req = SendMessage::builder()
-            .chat_id(cur_chat_id)
+            .chat_id(cur_chat.chat.id())
+            .reply_to_message_id(reply_to_message_id)
             .input_message_content(msg)
             .build();
         queue.lock().unwrap().push_back(req.to_json().unwrap());
@@ -319,11 +379,12 @@ impl TBlock for InputBox {
         &mut self,
         queue: &Arc<Mutex<VecDeque<String>>>,
         input: &termion::event::Key,
-        cur_chat_id: i64,
+        cur_chat: &mut TChat,
     ) {
         match input {
             Key::Char('\n') => {
-                self.send_message(cur_chat_id, queue);
+                self.send_message(cur_chat, queue);
+                cur_chat.msg_state = MsgState::Normal;
             }
 
             // Add unremarkable character to input string
@@ -382,6 +443,8 @@ impl TBlock for TChat {
             retrieving: -1,
             num_onscreen: 0,
             bottom_index: 0,
+            select_index: 0,
+            msg_state: MsgState::Normal,
             last_msg_date: Arc::new(Mutex::new(-1)),
         }
     }
@@ -392,6 +455,20 @@ impl TBlock for TChat {
 
     fn get_len(&self) -> usize {
         return self.history.lock().unwrap().len();
+    }
+
+    fn handle_input_visual(
+        &mut self,
+        _queue: &Arc<Mutex<VecDeque<String>>>,
+        input: &termion::event::Key,
+        _cur_chat_id: i64,
+    ) {
+        match input {
+            Key::Char('j') => self.select_down(),
+            Key::Char('k') => self.select_up(),
+            Key::Char('r') => self.select_msg(MsgAction::Reply),
+            _ => {}
+        }
     }
 
     // Scroll up such that the topmost message becomes the bottom one
@@ -817,7 +894,7 @@ fn ui_thread(
             chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2 * MARGIN).into();
             let mut chat_history = vec::Vec::new();
             let mut chat_title = "Current Chat".to_owned();
-            for (i, chat) in (app.chat_list.chat_vec)
+            for (i, mut chat) in (app.chat_list.chat_vec)
                 .lock()
                 .unwrap()
                 .iter_mut()
@@ -888,8 +965,36 @@ fn ui_thread(
                     "unknown".to_string()
                 };
                 chat_title = format!("{}: {}", *chat.chat.title(), extra_info);
+
+                match app.curr_mode {
+                    InputMode::Visual => app.chat_history_state.select(Some(chat.select_index)),
+                    _ => app.chat_history_state.select(None),
+                }
             }
 
+            // TODO: use built in TUI selectability
+            /*
+            let backend = TestBackend::new(10, 3);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let mut state = ListState::default();
+                state.select(Some(1));
+                terminal
+                    .draw(|f| {
+                        let size = f.size();
+                        let items = vec![
+                            ListItem::new("Item 1"),
+                            ListItem::new("Item 2"),
+                            ListItem::new("Item 3"),
+                        ];
+                        let list = List::new(items)
+                            .highlight_style(Style::default().bg(Color::Yellow))
+                            .highlight_symbol(">> ");
+                        f.render_stateful_widget(list, size, &mut state);
+                    })
+                    .unwrap();
+
+
+                           */
             let mut chats_block = List::new(chat_titles).block(
                 Block::default()
                     .title(app.chat_list.name)
@@ -897,6 +1002,8 @@ fn ui_thread(
             );
             let mut chat_block = List::new(chat_history)
                 .block(Block::default().title(chat_title).borders(Borders::ALL))
+                .highlight_style(Style::default().bg(Color::Yellow))
+                .highlight_symbol(">> ")
                 .start_corner(Corner::BottomLeft);
 
             let mut input_block = Block::default()
@@ -921,12 +1028,19 @@ fn ui_thread(
 
             f.render_widget(input_block, chunks[1]);
             f.render_widget(chats_block, chat_chunks[0]);
-            f.render_widget(chat_block, chat_chunks[1]);
+            f.render_stateful_widget(chat_block, chat_chunks[1], &mut app.chat_history_state);
             f.render_widget(input, chunks[1]);
         })?;
         let enext = match events.next() {
             Ok(eve) => eve,
             Err(_e) => return Err(Error::new(ErrorKind::Other, "oh no!")),
+        };
+        let cur_chat_id = match app
+            .chat_list
+            .get_chat_id_by_index(app.chat_list.selected_index())
+        {
+            Some(i) => i,
+            None => continue,
         };
         if let Event::Input(input) = enext {
             match app.curr_mode {
@@ -943,6 +1057,7 @@ fn ui_thread(
                         }
                     }
                     Key::Char('i') => app.curr_mode = InputMode::Insert,
+                    Key::Char('v') => app.curr_mode = InputMode::Visual,
                     _ => match selected_block {
                         TBlocks::ChatList => {
                             app.chat_list
@@ -953,7 +1068,7 @@ fn ui_thread(
                                 .chat_vec
                                 .lock()
                                 .unwrap()
-                                .get_mut(*app.chat_list.selected_index.lock().unwrap() as usize)
+                                .get_mut(app.chat_list.selected_index())
                                 .unwrap()
                                 .handle_input_normal(&app.outgoing_queue, &input);
                         }
@@ -961,34 +1076,38 @@ fn ui_thread(
                     },
                 },
                 //TODO: get_cur_chat_function
-                InputMode::Insert => {
-                    let cur_chat_id = app
-                        .chat_list
-                        .chat_vec
-                        .lock()
-                        .unwrap()
-                        .get((*app.chat_list.selected_index.lock().unwrap()) as usize)
-                        .unwrap()
-                        .chat
-                        .id();
-                    match input {
-                        Key::Esc => app.curr_mode = InputMode::Normal,
-                        _ => match selected_block {
-                            TBlocks::ChatList => app.chat_list.handle_input_insert(
-                                &app.outgoing_queue,
-                                &input,
-                                cur_chat_id,
-                            ),
-                            TBlocks::Input => app.input_box.handle_input_insert(
-                                &app.outgoing_queue,
-                                &input,
-                                cur_chat_id,
-                            ),
+                InputMode::Insert => match input {
+                    Key::Esc => app.curr_mode = InputMode::Normal,
+                    _ => match selected_block {
+                        TBlocks::Input => app.input_box.handle_input_insert(
+                            &app.outgoing_queue,
+                            &input,
+                            app.chat_list
+                                .chat_vec
+                                .lock()
+                                .unwrap()
+                                .get_mut(app.chat_list.selected_index())
+                                .unwrap(),
+                        ),
 
-                            _ => {}
-                        },
-                    }
-                }
+                        _ => {}
+                    },
+                },
+                InputMode::Visual => match input {
+                    Key::Esc => app.curr_mode = InputMode::Normal,
+                    _ => match selected_block {
+                        TBlocks::CurrChat => app
+                            .chat_list
+                            .chat_vec
+                            .lock()
+                            .unwrap()
+                            .get_mut(app.chat_list.selected_index())
+                            .unwrap()
+                            .handle_input_visual(&app.outgoing_queue, &input, cur_chat_id),
+
+                        _ => {}
+                    },
+                },
             }
         }
     }
