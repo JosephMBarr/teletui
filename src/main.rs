@@ -14,10 +14,10 @@ use std::vec;
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
     backend::TermionBackend,
-    layout::{Constraint, Corner, Direction, Layout},
+    layout::{Constraint, Corner, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 // Seconds to wait for message form Tdlib
@@ -184,9 +184,20 @@ impl TChat {
             self.select_index += 1;
         }
     }
+    fn get_selected_msg(&self) -> Message {
+        return self
+            .history
+            .lock()
+            .unwrap()
+            .get_mut(self.bottom_index + self.select_index)
+            .unwrap()
+            .clone();
+    }
     fn select_msg(&mut self, action: MsgAction) {
         match action {
-            MsgAction::Reply => self.msg_state = MsgState::Reply,
+            MsgAction::Reply => {
+                self.msg_state = MsgState::Reply;
+            }
             _ => {}
         }
     }
@@ -419,9 +430,10 @@ impl TBlock for Chats {
         // Wrap around when going over top
         if selected_index == 0 {
             selected_index = self.get_len() - 1;
+        } else {
+            // Go up by one chat
+            selected_index = (selected_index - 1) % self.get_len();
         }
-        // Go up by one chat
-        selected_index = (selected_index + 1) % self.get_len();
 
         self.set_selected_index(selected_index);
     }
@@ -893,113 +905,94 @@ fn ui_thread(
             chat_box_height = (chat_chunks[1].bottom() - chat_chunks[1].top() - 2 * MARGIN).into();
             chat_box_width = (chat_chunks[1].right() - chat_chunks[1].left() - 2 * MARGIN).into();
             let mut chat_history = vec::Vec::new();
-            let mut chat_title = "Current Chat".to_owned();
-            for (i, mut chat) in (app.chat_list.chat_vec)
+            for (i, chat) in (app.chat_list.chat_vec)
                 .lock()
                 .unwrap()
                 .iter_mut()
                 .enumerate()
             {
-                let chat_list_item = ListItem::new(Text::from(String::from(chat.chat.title())));
+                let title_item = ListItem::new(Text::from(String::from(chat.chat.title())));
                 if app.chat_list.selected_index() != i {
                     // Not selected, style as default and skip ahead to next
-                    chat_titles.push(chat_list_item.style(unselected_style));
+                    chat_titles.push(title_item.style(unselected_style));
                     continue;
+                } else {
+                    chat_titles.push(title_item.style(selected_style));
                 }
-                let (displayed_msgs, history_height) = build_msg_list(
-                    &chat,
-                    &ui_users,
-                    chat_box_width,
-                    chat_box_height,
-                    &mut chat_history,
-                );
-                chat_titles.push(chat_list_item.style(selected_style));
-                chat.num_onscreen = displayed_msgs;
-                //TODO: fix end of history
-                let oldest_id = chat.get_oldest_id();
-                if (history_height < chat_box_height.into()
-                    || chat.bottom_index + 2 * chat.num_onscreen >= chat_history.len())
-                    && !chat.end_of_history
-                {
-                    chat.retrieve_history(
-                        &app.outgoing_queue,
-                        oldest_id,
-                        (chat_box_height * 2) as i64,
-                    );
-                }
-                let extra_info = if chat.chat.type_().is_private() {
-                    // Get user and the time they were last seen
-                    let recipient_id = chat.chat.type_().as_private().unwrap().user_id();
-                    let recipient = ui_users.get(&recipient_id).unwrap();
-                    let status = &recipient.status;
-                    if status.is_online() {
-                        "online".to_string()
-                    } else if status.is_offline() {
-                        let ts: u64 = status.as_offline().unwrap().was_online() as u64;
-                        let d = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts);
-                        let date_time = DateTime::<Local>::from(d);
-                        format!("last seen {}", date_time.format("%H:%M on %m/%d"))
-                    } else {
-                        "unknown".to_string()
-                    }
-                } else if chat.chat.type_().is_basic_group() {
-                    let group_id = chat.chat.type_().as_basic_group().unwrap().basic_group_id();
-                    let group = ui_basic_groups.get(&group_id).unwrap();
-
-                    // Count up how many members in chat are online
-                    let members_online = group
-                        .full_info
-                        .members()
-                        .into_iter()
-                        .filter(|m| {
-                            let u = ui_users.get(&m.user_id()).unwrap();
-                            u.status.is_online() && u.u.type_().is_regular()
-                        })
-                        .count();
-                    format!(
-                        "{} members, {} online",
-                        group.g.member_count(),
-                        members_online
-                    )
+            }
+            let mut cv = app.chat_list.chat_vec.lock().unwrap();
+            let mut chat = match cv.get_mut(app.chat_list.selected_index()) {
+                Some(c) => c,
+                None => return,
+            };
+            let (displayed_msgs, history_height) = build_msg_list(
+                &chat,
+                &ui_users,
+                chat_box_width,
+                chat_box_height,
+                &mut chat_history,
+            );
+            chat.num_onscreen = displayed_msgs;
+            //TODO: fix end of history
+            let oldest_id = chat.get_oldest_id();
+            if (history_height < chat_box_height.into()
+                || chat.bottom_index + 2 * chat.num_onscreen >= chat_history.len())
+                && !chat.end_of_history
+            {
+                chat.retrieve_history(&app.outgoing_queue, oldest_id, (chat_box_height * 2) as i64);
+            }
+            let extra_info = if chat.chat.type_().is_private() {
+                // Get user and the time they were last seen
+                let recipient_id = chat.chat.type_().as_private().unwrap().user_id();
+                let recipient = ui_users.get(&recipient_id).unwrap();
+                let status = &recipient.status;
+                if status.is_online() {
+                    "online".to_string()
+                } else if status.is_offline() {
+                    let ts: u64 = status.as_offline().unwrap().was_online() as u64;
+                    let d = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts);
+                    let date_time = DateTime::<Local>::from(d);
+                    format!("last seen {}", date_time.format("%H:%M on %m/%d"))
                 } else {
                     "unknown".to_string()
-                };
-                chat_title = format!("{}: {}", *chat.chat.title(), extra_info);
+                }
+            } else if chat.chat.type_().is_basic_group() {
+                let group_id = chat.chat.type_().as_basic_group().unwrap().basic_group_id();
+                let group = ui_basic_groups.get(&group_id).unwrap();
 
-                match app.curr_mode {
-                    InputMode::Visual => app.chat_history_state.select(Some(chat.select_index)),
-                    _ => app.chat_history_state.select(None),
+                // Count up how many members in chat are online
+                let members_online = group
+                    .full_info
+                    .members()
+                    .into_iter()
+                    .filter(|m| {
+                        let u = ui_users.get(&m.user_id()).unwrap();
+                        u.status.is_online() && u.u.type_().is_regular()
+                    })
+                    .count();
+                format!(
+                    "{} members, {} online",
+                    group.g.member_count(),
+                    members_online
+                )
+            } else {
+                "unknown".to_string()
+            };
+            match app.curr_mode {
+                InputMode::Visual => app.chat_history_state.select(Some(chat.select_index)),
+                _ => {
+                    chat.msg_state = MsgState::Normal;
+                    app.chat_history_state.select(None)
                 }
             }
 
-            // TODO: use built in TUI selectability
-            /*
-            let backend = TestBackend::new(10, 3);
-                let mut terminal = Terminal::new(backend).unwrap();
-                let mut state = ListState::default();
-                state.select(Some(1));
-                terminal
-                    .draw(|f| {
-                        let size = f.size();
-                        let items = vec![
-                            ListItem::new("Item 1"),
-                            ListItem::new("Item 2"),
-                            ListItem::new("Item 3"),
-                        ];
-                        let list = List::new(items)
-                            .highlight_style(Style::default().bg(Color::Yellow))
-                            .highlight_symbol(">> ");
-                        f.render_stateful_widget(list, size, &mut state);
-                    })
-                    .unwrap();
-
-
-                           */
             let mut chats_block = List::new(chat_titles).block(
                 Block::default()
                     .title(app.chat_list.name)
                     .borders(Borders::ALL),
             );
+
+            let chat_title = format!("{}: {}", *chat.chat.title(), extra_info);
             let mut chat_block = List::new(chat_history)
                 .block(Block::default().title(chat_title).borders(Borders::ALL))
                 .highlight_style(Style::default().bg(Color::Yellow))
@@ -1030,6 +1023,36 @@ fn ui_thread(
             f.render_widget(chats_block, chat_chunks[0]);
             f.render_stateful_widget(chat_block, chat_chunks[1], &mut app.chat_history_state);
             f.render_widget(input, chunks[1]);
+            match chat.msg_state {
+                MsgState::Normal => {}
+                _ => {
+                    let secondary_title = match chat.msg_state {
+                        MsgState::Reply => "Replying to...",
+                        _ => "How?",
+                    };
+                    let secondary_msg = chat.get_selected_msg();
+                    let mut secondary_msg_rect = Rect::new(chunks[1].x, 0, chunks[1].width, 0);
+                    let secondary_msg_text = secondary_msg
+                        .content()
+                        .as_message_text()
+                        .unwrap()
+                        .text()
+                        .text()
+                        .to_string();
+                    let lines =
+                        textwrap::fill(&secondary_msg_text, secondary_msg_rect.width as usize);
+                    // Add two for margin and one for first line
+                    secondary_msg_rect.height = (lines.matches('\n').count() + 3) as u16;
+                    secondary_msg_rect.y = chunks[1].y - secondary_msg_rect.height;
+                    let secondary_msg_block = Paragraph::new(lines).block(
+                        Block::default()
+                            .title(secondary_title)
+                            .borders(Borders::ALL),
+                    );
+                    f.render_widget(Clear, secondary_msg_rect);
+                    f.render_widget(secondary_msg_block, secondary_msg_rect);
+                }
+            }
         })?;
         let enext = match events.next() {
             Ok(eve) => eve,
@@ -1043,6 +1066,14 @@ fn ui_thread(
             None => continue,
         };
         if let Event::Input(input) = enext {
+            match input {
+                Key::Esc => {
+                    app.curr_mode = InputMode::Normal;
+                    continue;
+                    //return Ok(());
+                }
+                _ => {}
+            }
             match app.curr_mode {
                 InputMode::Normal => match input {
                     Key::F(1) => {
@@ -1057,7 +1088,16 @@ fn ui_thread(
                         }
                     }
                     Key::Char('i') => app.curr_mode = InputMode::Insert,
-                    Key::Char('v') => app.curr_mode = InputMode::Visual,
+                    Key::Char('v') => {
+                        let mut cv = app.chat_list.chat_vec.lock().unwrap();
+                        match cv.get_mut(app.chat_list.selected_index()) {
+                            Some(c) => {
+                                c.select_index = 0;
+                                app.curr_mode = InputMode::Visual;
+                            }
+                            None => {}
+                        };
+                    }
                     _ => match selected_block {
                         TBlocks::ChatList => {
                             app.chat_list
@@ -1077,7 +1117,6 @@ fn ui_thread(
                 },
                 //TODO: get_cur_chat_function
                 InputMode::Insert => match input {
-                    Key::Esc => app.curr_mode = InputMode::Normal,
                     _ => match selected_block {
                         TBlocks::Input => app.input_box.handle_input_insert(
                             &app.outgoing_queue,
@@ -1094,7 +1133,6 @@ fn ui_thread(
                     },
                 },
                 InputMode::Visual => match input {
-                    Key::Esc => app.curr_mode = InputMode::Normal,
                     _ => match selected_block {
                         TBlocks::CurrChat => app
                             .chat_list
