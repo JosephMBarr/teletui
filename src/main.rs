@@ -58,7 +58,7 @@ enum InputMode {
 }
 #[derive(Clone)]
 enum MsgAction {
-    _Edit,
+    Edit,
     Reply,
     _Delete,
 }
@@ -66,11 +66,12 @@ enum MsgAction {
 #[derive(Clone)]
 enum MsgState {
     Normal,
-    _Edit,
+    Edit,
     Reply,
 }
 
 // TUI Blocks
+#[derive(PartialEq)]
 enum TBlocks {
     ChatList,
     CurrChat,
@@ -113,8 +114,6 @@ struct TBasicGroup {
 // The message input box
 #[derive(Clone)]
 struct InputBox {
-    input_str: String,
-
     // Box title
     name: &'static str,
 }
@@ -146,6 +145,9 @@ struct TUser {
 // A wrapper for Tdlib Chat with extra information
 #[derive(Clone)]
 struct TChat {
+    // Current input string for this Chat
+    input_str: Arc<Mutex<String>>,
+
     // History of messages in this chat
     history: Arc<Mutex<Vec<Message>>>,
 
@@ -177,13 +179,6 @@ struct TChat {
 impl App {}
 
 impl TChat {
-    fn select_up(&mut self) {
-        if self.select_index >= self.num_onscreen {
-            self.select_index = 0;
-        } else {
-            self.select_index += 1;
-        }
-    }
     fn get_selected_msg(&self) -> Message {
         return self
             .history
@@ -198,10 +193,30 @@ impl TChat {
             MsgAction::Reply => {
                 self.msg_state = MsgState::Reply;
             }
+            MsgAction::Edit => {
+                let m = self.get_selected_msg();
+                if m.can_be_edited() {
+                    self.msg_state = MsgState::Edit;
+                    let mut i = self.input_str.lock().unwrap();
+                    i.clear();
+                    i.push_str(m.content().as_message_text().unwrap().text().text());
+                } else {
+                    self.msg_state = MsgState::Normal;
+                }
+            }
             _ => {}
         }
     }
+    fn select_up(&mut self) {
+        self.msg_state = MsgState::Normal;
+        if self.select_index >= self.num_onscreen {
+            self.select_index = 0;
+        } else {
+            self.select_index += 1;
+        }
+    }
     fn select_down(&mut self) {
+        self.msg_state = MsgState::Normal;
         if self.select_index == 0 {
             self.select_index = self.num_onscreen - 1;
         } else {
@@ -353,38 +368,43 @@ impl InputBox {
     // Creates message to be sent to chat, using passed in chat ID and the contents of
     // the input string
     fn send_message(&mut self, cur_chat: &mut TChat, queue: &Arc<Mutex<VecDeque<String>>>) {
+        eprintln!("send message starts!");
         let msg = InputMessageContent::InputMessageText(
             InputMessageText::builder()
-                .text(FormattedText::builder().text(self.input_str.clone()))
+                .text(FormattedText::builder().text(cur_chat.input_str.lock().unwrap().as_str()))
                 .build(),
         );
-        let h = cur_chat.history.lock().unwrap();
-        let reply_to_message_id = match cur_chat.msg_state {
-            MsgState::Reply => {
+        let secondary_message_id = match cur_chat.msg_state {
+            MsgState::Normal => 0,
+            _ => {
                 // Get the message that is being replied to, based on history offset
                 // and on screen index
-                h.get(cur_chat.bottom_index + cur_chat.select_index)
-                    .unwrap()
-                    .id()
+                cur_chat.get_selected_msg().id()
             }
-            _ => 0,
         };
-        let req = SendMessage::builder()
-            .chat_id(cur_chat.chat.id())
-            .reply_to_message_id(reply_to_message_id)
-            .input_message_content(msg)
-            .build();
-        queue.lock().unwrap().push_back(req.to_json().unwrap());
-        self.input_str.clear();
+        match cur_chat.msg_state {
+            MsgState::Edit => edit_message(
+                queue,
+                cur_chat.chat.id(),
+                secondary_message_id,
+                cur_chat.input_str.lock().unwrap().to_string(),
+            ),
+            _ => {
+                let req = SendMessage::builder()
+                    .chat_id(cur_chat.chat.id())
+                    .reply_to_message_id(secondary_message_id)
+                    .input_message_content(msg)
+                    .build();
+                queue.lock().unwrap().push_back(req.to_json().unwrap());
+            }
+        }
+        cur_chat.input_str.lock().unwrap().clear();
     }
 }
 
 impl TBlock for InputBox {
     fn new(name: &'static str) -> InputBox {
-        InputBox {
-            input_str: String::new(),
-            name,
-        }
+        InputBox { name }
     }
     fn handle_input_insert(
         &mut self,
@@ -400,10 +420,10 @@ impl TBlock for InputBox {
 
             // Add unremarkable character to input string
             Key::Char(input) => {
-                self.input_str.push(*input);
+                cur_chat.input_str.lock().unwrap().push(*input);
             }
             Key::Backspace => {
-                self.input_str.pop();
+                cur_chat.input_str.lock().unwrap().pop();
             }
 
             _ => {}
@@ -458,6 +478,7 @@ impl TBlock for TChat {
             select_index: 0,
             msg_state: MsgState::Normal,
             last_msg_date: Arc::new(Mutex::new(-1)),
+            input_str: Arc::new(Mutex::new(String::new())),
         }
     }
     // Go all the way to the bottom (e.g. newest message)
@@ -479,6 +500,7 @@ impl TBlock for TChat {
             Key::Char('j') => self.select_down(),
             Key::Char('k') => self.select_up(),
             Key::Char('r') => self.select_msg(MsgAction::Reply),
+            Key::Char('e') => self.select_msg(MsgAction::Edit),
             _ => {}
         }
     }
@@ -979,11 +1001,10 @@ fn ui_thread(
                 "unknown".to_string()
             };
             match app.curr_mode {
-                InputMode::Visual => app.chat_history_state.select(Some(chat.select_index)),
-                _ => {
-                    chat.msg_state = MsgState::Normal;
-                    app.chat_history_state.select(None)
+                InputMode::Visual if selected_block == TBlocks::CurrChat => {
+                    app.chat_history_state.select(Some(chat.select_index))
                 }
+                _ => app.chat_history_state.select(None),
             }
 
             let mut chats_block = List::new(chat_titles).block(
@@ -996,14 +1017,13 @@ fn ui_thread(
             let mut chat_block = List::new(chat_history)
                 .block(Block::default().title(chat_title).borders(Borders::ALL))
                 .highlight_style(Style::default().bg(Color::Yellow))
-                .highlight_symbol(">> ")
                 .start_corner(Corner::BottomLeft);
 
             let mut input_block = Block::default()
                 .title(app.input_box.name)
                 .borders(Borders::ALL);
             let input = Paragraph::new(Text::styled(
-                app.input_box.input_str.to_string(),
+                chat.input_str.lock().unwrap().to_string(),
                 unselected_style,
             ))
             .block(
@@ -1028,6 +1048,7 @@ fn ui_thread(
                 _ => {
                     let secondary_title = match chat.msg_state {
                         MsgState::Reply => "Replying to...",
+                        MsgState::Edit => "Editing...",
                         _ => "How?",
                     };
                     let secondary_msg = chat.get_selected_msg();
@@ -1278,4 +1299,19 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
         Ok(ok) => ok,
     };
     return cur_msg;
+}
+
+fn edit_message(queue: &Arc<Mutex<VecDeque<String>>>, chat_id: i64, msg_id: i64, msg: String) {
+    eprintln!("editing msg {:#?}", msg);
+    let msg_text = InputMessageContent::InputMessageText(
+        InputMessageText::builder()
+            .text(FormattedText::builder().text(msg.as_str()).build())
+            .build(),
+    );
+    let req = EditMessageText::builder()
+        .chat_id(chat_id)
+        .message_id(msg_id)
+        .input_message_content(msg_text)
+        .build();
+    queue.lock().unwrap().push_back(req.to_json().unwrap());
 }
