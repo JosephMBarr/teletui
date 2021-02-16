@@ -27,7 +27,7 @@ const TIMEOUT: f64 = 0.5;
 const MARGIN: u16 = 1;
 
 const DEBUG_LEVEL: i64 = 0;
-const DO_DEBUG: bool = false;
+const DO_DEBUG: bool = true;
 const CODE_ARG: &str = "--code=";
 const NO_CODE_PROVIDED: &str = "Please re-run with --code={{code}}";
 const COLORS: [Color; 13] = [
