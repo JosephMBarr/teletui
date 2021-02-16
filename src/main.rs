@@ -60,7 +60,6 @@ enum InputMode {
 enum MsgAction {
     Edit,
     Reply,
-    _Delete,
 }
 
 #[derive(Clone)]
@@ -204,10 +203,19 @@ impl TChat {
                     self.msg_state = MsgState::Normal;
                 }
             }
+        }
+    }
+    fn selection_change(&mut self) {
+        match self.msg_state {
+            MsgState::Edit => {
+                eprintln!("input string is {}", self.input_str.lock().unwrap());
+                self.input_str.lock().unwrap().clear();
+            }
             _ => {}
         }
     }
     fn select_up(&mut self) {
+        self.selection_change();
         self.msg_state = MsgState::Normal;
         if self.select_index >= self.num_onscreen {
             self.select_index = 0;
@@ -216,6 +224,7 @@ impl TChat {
         }
     }
     fn select_down(&mut self) {
+        self.selection_change();
         self.msg_state = MsgState::Normal;
         if self.select_index == 0 {
             self.select_index = self.num_onscreen - 1;
@@ -1302,7 +1311,6 @@ fn parse_msg(cur_msg: &mut Value, chat_id: i64) -> Message {
 }
 
 fn edit_message(queue: &Arc<Mutex<VecDeque<String>>>, chat_id: i64, msg_id: i64, msg: String) {
-    eprintln!("editing msg {:#?}", msg);
     let msg_text = InputMessageContent::InputMessageText(
         InputMessageText::builder()
             .text(FormattedText::builder().text(msg.as_str()).build())
