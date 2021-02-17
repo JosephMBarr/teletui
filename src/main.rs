@@ -3,6 +3,7 @@ use chrono::prelude::*;
 mod event;
 use crossbeam::thread;
 use event::{Event, Events};
+use notify_rust;
 use rtdlib::types::*;
 use rtdlib::Tdlib;
 use serde_json::{json, Value};
@@ -89,6 +90,7 @@ struct App {
     chat_list: Chats,
     input_box: InputBox,
     chat_history_state: ListState,
+    me: User,
 }
 impl App {
     fn new() -> App {
@@ -100,6 +102,7 @@ impl App {
             chat_list: Chats::new("Chats"),
             input_box: InputBox::new("Input"),
             chat_history_state: ListState::default(),
+            me: User::default(),
         }
     }
 }
@@ -208,7 +211,6 @@ impl TChat {
     fn selection_change(&mut self) {
         match self.msg_state {
             MsgState::Edit => {
-                eprintln!("input string is {}", self.input_str.lock().unwrap());
                 self.input_str.lock().unwrap().clear();
             }
             _ => {}
@@ -641,6 +643,12 @@ fn send_check_encryption_key(tdlib: &Tdlib) {
     tdlib.send(&check_enc_key.to_json().unwrap());
 }
 
+// Get current user
+fn get_me(tdlib: &Tdlib) {
+    let req = GetMe::builder().build();
+    tdlib.send(&req.to_json().unwrap());
+}
+
 // Send phone number to Tdlib to connect app with account
 fn send_phone_parameters(tdlib: &Tdlib, phone_number: &str) {
     let phone_parameters = SetAuthenticationPhoneNumber::builder()
@@ -701,6 +709,7 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
                         //AuthorizationState::Ready => {
                         //TODO: store auth credentials
                         get_chat_list(&tdlib);
+                        get_me(&tdlib);
                     }
                     // Initial setup request
                     AuthorizationState::WaitTdlibParameters(_) => {
@@ -836,13 +845,23 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
 
                 // Parse message into rtdlib::Message type
                 let cur_msg = parse_msg(msg, chat_id);
+                let sender_name = match app.users.lock().unwrap().get(&cur_msg.sender_user_id()) {
+                    Some(u) => format!("{} {}", u.u.first_name(), u.u.last_name()),
+                    None => "Unknown User".to_string(),
+                };
+                if app.me.id() > 0 && app.me.id() != cur_msg.sender_user_id() {
+                    notify_rust::Notification::new()
+                        .summary(sender_name.as_str())
+                        .body(cur_msg.content().as_message_text().unwrap().text().text())
+                        .show()
+                        .unwrap();
+                }
                 // Place at start, rather than push to end
                 cur_chat_history.insert(0, cur_msg);
             }
 
             // Received a list of messages, initiated by GetChatHistory call
             "messages" => {
-                eprintln!("messages is {}", obj);
                 let msg_count = obj["total_count"].as_u64().unwrap();
                 let msg_list = &mut obj["messages"];
                 let chat_id = match msg_list[0]["chat_id"].as_i64() {
@@ -880,6 +899,9 @@ fn td_thread(tdlib: &Tdlib, app: &mut App, tx: mpsc::Sender<MsgCode>, rx: mpsc::
                     return;
                 }
             }
+            "user" => {
+                app.me = User::from_json(obj.to_string()).unwrap();
+            }
             _ => {
                 eprintln!("Unhandled message: {}", obj);
             }
@@ -908,7 +930,7 @@ fn ui_thread(
     let mut selected_block = TBlocks::ChatList;
 
     terminal.clear()?;
-    let mut chat_box_height = 0;
+    let mut chat_box_height: usize = 0;
     let mut chat_box_width: usize = 0;
     loop {
         if let Ok(c) = rx.try_recv() {
@@ -1199,8 +1221,9 @@ fn build_msg_list(
     let text_style = Style::default()
         .remove_modifier(Modifier::BOLD)
         .fg(Color::White);
+
     // Iterate through the chat hsitory, starting at the bottommost message that is to be displayed
-    for msg in h[chat.bottom_index..].iter() {
+    for msg in h.iter().skip(chat.bottom_index) {
         let msg_text = match msg.content().as_message_text() {
             Some(s) => s.text().text().to_string(),
             None => "[none]".to_string(),
@@ -1213,7 +1236,6 @@ fn build_msg_list(
 
         let full_msg = format!("{}: {}", sender_name, msg_text);
         let lines = textwrap::fill(&full_msg, chat_box_width);
-        //let mut lis = Text::from("");
         let mut lis = Vec::new();
         for (i, l) in lines.lines().enumerate() {
             if l.len() == 0 {
