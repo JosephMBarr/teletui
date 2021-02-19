@@ -594,6 +594,7 @@ fn main() {
         let _render_thread = s.spawn(move |_| {
             // Spawn thread for managing requests
             render_thread(&mut render_app, &rx_ren).unwrap();
+            std::process::exit(0);
         });
 
         // Spawn UI thread
@@ -721,11 +722,10 @@ fn td_thread(
             Some(r) => r,
             None => continue,
         };
-        tx.send(MsgCode::Update).unwrap();
         // Decode request string into an object
         let mut obj: Value = serde_json::from_str(&res).unwrap();
         if DO_DEBUG {
-            eprintln!("Received: {:?}", obj.get("@type"));
+            eprintln!("Received: {:?}", obj);
         }
         match &detect_td_type(&res).unwrap()[..] {
             // Received any of a number of auth state changes
@@ -935,6 +935,7 @@ fn td_thread(
                 eprintln!("Unhandled message: {}", obj);
             }
         }
+        tx.send(MsgCode::Update).unwrap();
     }
 }
 
@@ -1009,6 +1010,7 @@ fn render_thread(app: &mut App, rx: &mpsc::Receiver<MsgCode>) -> Result<(), std:
                 chat_box_height,
                 &mut chat_history,
             );
+            eprintln!("history height: {}", history_height);
             chat.num_onscreen = displayed_msgs;
             //TODO: fix end of history
             let oldest_id = chat.get_oldest_id();
